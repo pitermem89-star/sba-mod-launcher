@@ -8,3 +8,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download original apk
+        run: curl -L -o original.apk https://github.com/${{ github.repository }}/releases/download/v1/split_config.arm64_v8a.apk
+
+      - name: Replace libmain.so
+        run: |
+          sudo apt-get install -y zip unzip
+          mkdir extracted
+          cd extracted
+          unzip ../original.apk -d .
+          cp ../libmain.so lib/arm64-v8a/libmain.so
+          zip -r ../patched.apk .
+          cd ..
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install build tools
+        run: |
+          curl -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip cmdline-tools.zip -d cmdline-tools
+          yes | cmdline-tools/cmdline-tools/bin/sdkmanager --sdk_root=$PWD/android-sdk "build-tools;34.0.0"
+
+      - name: Generate key
+        run: keytool -genkeypair -v -keystore my-key.jks -keyalg RSA -keysize 2048 -validity 10000 -alias mykey -storepass 123456 -keypass 123456 -dname "CN=sba"
+
+      - name: Sign apk
+        run: android-sdk/build-tools/34.0.0/apksigner sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out patched-signed.apk patched.apk
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-apk
+          path: patched-signed.apk
