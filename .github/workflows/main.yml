@@ -9,17 +9,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download original apk
-        run: curl -L -o original.apk https://github.com/${{ github.repository }}/releases/download/v1/split_config.arm64_v8a.apk
+      - name: Download files
+        run: |
+          curl -L -o base.apk https://github.com/${{ github.repository }}/releases/download/v1/base.apk
+          curl -L -o split_config.arm64_v8a.apk https://github.com/${{ github.repository }}/releases/download/v1/split_config.arm64_v8a.apk
+          curl -L -o split_gpdeku.apk https://github.com/${{ github.repository }}/releases/download/v1/split_gpdeku.apk
+          curl -L -o split_gpdeku.config.arm64_v8a.apk https://github.com/${{ github.repository }}/releases/download/v1/split_gpdeku.config.arm64_v8a.apk
 
       - name: Replace libmain.so
         run: |
           sudo apt-get install -y zip unzip
           mkdir extracted
           cd extracted
-          unzip ../original.apk -d .
+          unzip ../split_config.arm64_v8a.apk -d .
           cp ../libmain.so lib/arm64-v8a/libmain.so
-          zip -r ../patched.apk .
+          zip -r ../split_config.arm64_v8a.patched.apk .
           cd ..
 
       - name: Setup Java
@@ -37,11 +41,20 @@ jobs:
       - name: Generate key
         run: keytool -genkeypair -v -keystore my-key.jks -keyalg RSA -keysize 2048 -validity 10000 -alias mykey -storepass 123456 -keypass 123456 -dname "CN=sba"
 
-      - name: Sign apk
-        run: android-sdk/build-tools/34.0.0/apksigner sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out patched-signed.apk patched.apk
+      - name: Sign all apks
+        run: |
+          SIGNER=android-sdk/build-tools/34.0.0/apksigner
+          $SIGNER sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out base-signed.apk base.apk
+          $SIGNER sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out split_config.arm64_v8a-signed.apk split_config.arm64_v8a.patched.apk
+          $SIGNER sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out split_gpdeku-signed.apk split_gpdeku.apk
+          $SIGNER sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out split_gpdeku.config.arm64_v8a-signed.apk split_gpdeku.config.arm64_v8a.apk
 
-      - name: Upload result
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: patched-apk
-          path: patched-signed.apk
+          name: patched-apks
+          path: |
+            base-signed.apk
+            split_config.arm64_v8a-signed.apk
+            split_gpdeku-signed.apk
+            split_gpdeku.config.arm64_v8a-signed.apk
