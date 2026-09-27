@@ -5,20 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>SBA Mod Launcher</title>
     <style>
-        /* Настройки экрана под твой рисунок */
         html, body {
             margin: 0;
             padding: 0;
             width: 100%;
             height: 100%;
-            background-color: #1e1f22; /* Серый фон главного экрана */
+            background-color: #1e1f22; 
             font-family: system-ui, sans-serif;
             overflow: hidden;
             display: flex;
             flex-direction: column;
         }
 
-        /* Верхняя зона приложения */
         .top-section {
             flex: 1; 
             display: flex;
@@ -26,7 +24,7 @@
             overflow: hidden;
         }
 
-        /* Левая серая панель из твоего рисунка */
+        /* Левая серая панель */
         .sidebar {
             width: 75px;
             background-color: #2b2d31; 
@@ -38,7 +36,7 @@
             border-right: 1px solid #1e1f22;
         }
 
-        /* Квадратные серые кнопки */
+        /* Серые квадратные кнопки */
         .tab-btn {
             width: 55px;
             height: 55px;
@@ -53,7 +51,6 @@
             overflow: hidden;
         }
 
-        /* Твои картинки внутри кнопок */
         .tab-btn img {
             width: 100%;
             height: 100%;
@@ -64,7 +61,7 @@
             background-color: #3c3f45; 
         }
 
-        /* Пустое место для вкладок */
+        /* Рабочая область */
         .content-area {
             flex: 1;
             padding: 20px;
@@ -80,7 +77,18 @@
             display: block;
         }
 
-        /* Твоя нижняя серая панель */
+        /* Блок, куда будут красиво вставать онлайн-новости */
+        .news-box {
+            background-color: #2b2d31;
+            border: 1px solid #3f4248;
+            border-radius: 8px;
+            padding: 15px;
+            white-space: pre-wrap; /* Чтобы текст сохранял абзацы как в файле */
+            line-height: 1.5;
+            font-size: 15px;
+        }
+
+        /* Нижняя панель */
         .bottom-bar {
             height: 70px;
             background-color: #2b2d31; 
@@ -92,7 +100,6 @@
             box-sizing: border-box;
         }
 
-        /* Кнопка играть из твоего макета */
         .play-btn {
             background-color: #1e1f22;
             color: #ffffff;
@@ -115,36 +122,39 @@
 
     <div class="top-section">
         
-        <!-- Меню теперь ищет картинки локально в папке assets -->
         <div class="sidebar">
             <button class="tab-btn active" onclick="switchTab('news', this)">
-                <img src="assets/home.png" alt="">
+                <img src="assets/home.png" alt="🏠">
             </button>
             <button class="tab-btn" onclick="switchTab('mods', this)">
-                <img src="assets/mods.png" alt="">
+                <img src="assets/mods.png" alt="🧩">
             </button>
             <button class="tab-btn" onclick="switchTab('textures', this)">
-                <img src="assets/textures.png" alt="">
+                <img src="assets/textures.png" alt="🖼️">
             </button>
             <button class="tab-btn" onclick="switchTab('settings', this)">
-                <img src="assets/settings.png" alt="">
+                <img src="assets/settings.png" alt="⚙️">
             </button>
         </div>
 
-        <!-- Центральное пустое место, где меняется текст при нажатии на кнопки -->
         <div class="content-area">
+            <!-- ВКЛАДКА НОВОСТЕЙ -->
             <div id="news" class="tab-content active">
                 <h2>новости</h2>
-                <p>Здесь будут выводиться главные новости нашего лаунчера.</p>
+                <!-- Сюда наш шпион вставит текст из интернета -->
+                <div class="news-box" id="load-news">Загрузка свежих новостей...</div>
             </div>
+            
             <div id="mods" class="tab-content">
                 <h2>моды</h2>
                 <p>Список доступных модификаций в стиле Genshin.</p>
             </div>
+            
             <div id="textures" class="tab-content">
                 <h2>текстур паки</h2>
                 <p>Выбор графики и скинов.</p>
             </div>
+            
             <div id="settings" class="tab-content">
                 <h2>настройки</h2>
                 <p>Параметры приложения.</p>
@@ -157,8 +167,8 @@
         <button class="play-btn">играть</button>
     </div>
 
-    <!-- Логика переключения кнопок -->
     <script>
+        // Функция переключения вкладок
         function switchTab(tabId, button) {
             const contents = document.querySelectorAll('.tab-content');
             contents.forEach(content => content.classList.remove('active'));
@@ -169,7 +179,28 @@
             document.getElementById(tabId).classList.add('active');
             button.classList.add('active');
         }
+
+        // Функция-шпион, которая летит на GitHub за новостями
+        async function loadOnlineNews() {
+            // Ссылка на твой файл news.txt на GitHub
+            const url = "https://githubusercontent.com";
+            const newsBox = document.getElementById("load-news");
+
+            try {
+                const response = await fetch(url);
+                if (!response.ok) throw new Error("Не удалось загрузить");
+                const text = await response.text();
+                
+                // Вставляем скачанный текст вместо надписи "Загрузка..."
+                newsBox.innerText = text;
+            } catch (error) {
+                // Если нет интернета, покажем красивую ошибку
+                newsBox.innerText = "❌ Не удалось обновить новости. Проверь подключение к интернету!";
+            }
+        }
+
+        // Запускаем шпиона сразу, как только приложение включилось
+        window.onload = loadOnlineNews;
     </script>
 </body>
-      </html>
-      
+</html>
