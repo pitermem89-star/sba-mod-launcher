@@ -23,7 +23,7 @@ jobs:
           cd extracted
           unzip ../split_config.arm64_v8a.apk -d .
           cp ../libmain.so lib/arm64-v8a/libmain.so
-          zip -r ../split_config.arm64_v8a.patched.apk .
+          zip -r -0 ../split_config.arm64_v8a.patched.apk .
           cd ..
 
       - name: Setup Java
