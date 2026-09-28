@@ -1,0 +1,328 @@
+name: Inspect APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag with the APK (empty = latest release)"
+        required: false
+        default: ""
+      asset:
+        description: "Asset name pattern (.apk, .xapk or .apks)"
+        required: false
+        default: "*.apk"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # No -e / pipefail on purpose: detection steps must tolerate misses.
+    shell: bash {0}
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download APK from Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ASSET: ${{ inputs.asset }}
+        run: |
+          mkdir -p work/input work/apk out
+          if [ -n "$TAG" ]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir work/input --clobber || exit 1
+          else
+            gh release download --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir work/input --clobber || exit 1
+          fi
+
+          FILE=$(ls -1 work/input | head -n1)
+          if [ -z "$FILE" ]; then
+            echo "::error::No release asset matched pattern '$ASSET'"
+            exit 1
+          fi
+          if [ "$(ls -1 work/input | wc -l)" -gt 1 ]; then
+            echo "::warning::Several assets matched, using: $FILE"
+          fi
+
+          case "$FILE" in
+            *.apk)
+              BASE="work/input/$FILE"
+              unzip -q -o "$BASE" -d work/apk
+              ;;
+            *.xapk|*.apks|*.zip)
+              # Split bundle: find base.apk (or the biggest apk) and merge all splits.
+              mkdir -p work/bundle
+              unzip -q -o "work/input/$FILE" -d work/bundle
+              BASE=$(find work/bundle -name 'base.apk' | head -n1)
+              if [ -z "$BASE" ]; then
+                BASE=$(find work/bundle -name '*.apk' -printf '%s %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)
+              fi
+              find work/bundle -name '*.apk' -print0 | while IFS= read -r -d '' a; do
+                unzip -q -o "$a" -d work/apk
+              done
+              ;;
+            *)
+              echo "::error::Unsupported file type: $FILE"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$BASE" ] || [ ! -f "$BASE" ]; then
+            echo "::error::Could not locate base APK"
+            exit 1
+          fi
+          echo "FILE=$FILE" >> "$GITHUB_ENV"
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+
+      - name: Inspect APK
+        id: inspect
+        run: |
+          A=work/apk
+          MANAGED=$A/assets/bin/Data/Managed
+          META=$MANAGED/Metadata/global-metadata.dat
+          : > work/info.env
+          kv() { printf '%s=%q\n' "$1" "$2" >> work/info.env; }
+
+          # --- Android SDK tools preinstalled on the runner ---
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BTV=$(ls -1 "$SDK/build-tools" | sort -V | tail -n1)
+          BT="$SDK/build-tools/$BTV"
+
+          # --- Manifest info (aapt2) ---
+          BADGING=$("$BT/aapt2" dump badging "$BASE" 2>&1)
+          bg() { printf '%s\n' "$BADGING" | sed -n "$1" | head -n1; }
+          PKG=$(bg "s/^package: name='\([^']*\)'.*/\1/p")
+          VCODE=$(bg "s/^package:.* versionCode='\([^']*\)'.*/\1/p")
+          VNAME=$(bg "s/^package:.* versionName='\([^']*\)'.*/\1/p")
+          MINSDK=$(bg "s/^sdkVersion:'\([^']*\)'.*/\1/p")
+          TGTSDK=$(bg "s/^targetSdkVersion:'\([^']*\)'.*/\1/p")
+          LAUNCH=$(bg "s/^launchable-activity: name='\([^']*\)'.*/\1/p")
+          NC=$(bg "s/^native-code: *//p" | tr -d "'")
+
+          # --- File facts ---
+          SIZE=$(stat -c %s "$BASE")
+          SHA=$(sha256sum "$BASE" | cut -d' ' -f1)
+
+          # --- ABIs and native libraries ---
+          ABIS=$(ls -1 $A/lib 2>/dev/null | paste -sd, -)
+          find $A/lib -type f -name '*.so' -printf '%P\t%s\n' 2>/dev/null | sort > out/native-libs.txt
+
+          # --- Unity version ---
+          RX='(?<![0-9.])(20[0-9]{2}|6000|[56])\.[0-9]+\.[0-9]+[abfp][0-9]+'
+          UV=""; UVSRC=""
+          G=$A/assets/bin/Data/globalgamemanagers
+          D=$A/assets/bin/Data/data.unity3d
+          if [ -f "$G" ]; then
+            UV=$(head -c 4096 "$G" | grep -aoP "$RX" | head -n1); UVSRC="globalgamemanagers"
+          fi
+          if [ -z "$UV" ] && [ -f "$D" ]; then
+            UV=$(head -c 512 "$D" | grep -aoP "$RX" | head -n1); UVSRC="data.unity3d header"
+          fi
+          if [ -z "$UV" ]; then
+            L=$(find $A/lib -name libunity.so | head -n1)
+            if [ -n "$L" ]; then
+              UV=$(grep -aoP "$RX" "$L" | sort | uniq -c | sort -rn | head -n1 | awk '{print $2}')
+              UVSRC="libunity.so (low confidence)"
+            fi
+          fi
+
+          # --- Scripting backend ---
+          IL2CPP_SO=""
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            if [ -f "$A/lib/$abi/libil2cpp.so" ]; then IL2CPP_SO="$A/lib/$abi/libil2cpp.so"; break; fi
+          done
+          MONO_SO=$(find $A/lib -name 'libmono*.so' 2>/dev/null | head -n1)
+          if [ -n "$IL2CPP_SO" ] || [ -f "$META" ]; then
+            BACKEND="IL2CPP"
+          elif [ -n "$MONO_SO" ] || [ -f "$MANAGED/Assembly-CSharp.dll" ]; then
+            BACKEND="Mono"
+          else
+            BACKEND="unknown"
+          fi
+
+          # --- Backend details ---
+          DETAIL=""
+          find $MANAGED -maxdepth 1 -name '*.dll' -printf '%f\n' 2>/dev/null | sort > out/managed-dlls.txt
+          if [ "$BACKEND" = "Mono" ]; then
+            if [ -f "$MANAGED/Assembly-CSharp.dll" ]; then
+              if [ "$(head -c2 "$MANAGED/Assembly-CSharp.dll")" = "MZ" ]; then
+                DETAIL="Assembly-CSharp.dll: plain .NET assembly (MZ header)"
+              else
+                DETAIL="Assembly-CSharp.dll: NOT a plain PE file (encrypted or packed?)"
+              fi
+            else
+              DETAIL="Assembly-CSharp.dll not found in assets/bin/Data/Managed"
+            fi
+          elif [ "$BACKEND" = "IL2CPP" ]; then
+            if [ -f "$META" ]; then
+              MAGIC=$(od -An -tx1 -N4 "$META" | tr -d ' \n')
+              if [ "$MAGIC" = "af1bb1fa" ]; then
+                DETAIL="global-metadata.dat: standard header"
+              else
+                DETAIL="global-metadata.dat: NON-standard header ($MAGIC), probably encrypted"
+              fi
+            else
+              DETAIL="global-metadata.dat not found"
+            fi
+          fi
+
+          # --- Java side: entry activity base class ---
+          DEXN=$(ls -1 $A/classes*.dex 2>/dev/null | wc -l)
+          UPA=$(grep -al 'com/unity3d/player/UnityPlayerActivity' $A/classes*.dex 2>/dev/null | wc -l)
+          UPG=$(grep -al 'com/unity3d/player/UnityPlayerGameActivity' $A/classes*.dex 2>/dev/null | wc -l)
+
+          # --- Signature schemes ---
+          "$BT/apksigner" verify -v --print-certs "$BASE" 2>&1 \
+            | grep -E 'Verified using|certificate SHA-256' | head -n8 > out/signature.txt
+
+          # --- Warnings ---
+          WARN=""
+          if [ -z "$ABIS" ]; then
+            WARN="$WARN No lib/ folder: this may be a split APK without native libs. Use .xapk/.apks or a full APK."
+          fi
+          if [ ! -d "$A/assets/bin/Data" ]; then
+            WARN="$WARN assets/bin/Data missing: game data may be in an .obb file or a split."
+          fi
+
+          for k in FILE SIZE SHA PKG VCODE VNAME MINSDK TGTSDK LAUNCH NC ABIS UV UVSRC BACKEND DETAIL DEXN UPA UPG WARN BTV; do
+            kv "$k" "${!k}"
+          done
+          echo "backend=$BACKEND" >> "$GITHUB_OUTPUT"
+          echo "so=$IL2CPP_SO" >> "$GITHUB_OUTPUT"
+          echo "meta=$META" >> "$GITHUB_OUTPUT"
+
+      - name: Set up .NET (for Il2CppDumper)
+        if: steps.inspect.outputs.backend == 'IL2CPP'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run Il2CppDumper
+        id: dump
+        if: steps.inspect.outputs.backend == 'IL2CPP'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SO: ${{ steps.inspect.outputs.so }}
+          META: ${{ steps.inspect.outputs.meta }}
+        run: |
+          mkdir -p work/tools work/dump out
+          if [ -z "$SO" ] || [ ! -f "$SO" ]; then
+            echo "Il2CppDumper: skipped, libil2cpp.so not found" > out/il2cpp-summary.txt
+            exit 0
+          fi
+          if [ ! -f "$META" ]; then
+            echo "Il2CppDumper: skipped, global-metadata.dat not found" > out/il2cpp-summary.txt
+            exit 0
+          fi
+
+          gh release download --repo Perfare/Il2CppDumper --pattern '*.zip' --dir work/tools --clobber
+          ZIP=""
+          for k in net8 net7 net6; do
+            ZIP=$(ls -1 work/tools/*.zip 2>/dev/null | grep -m1 "$k")
+            [ -n "$ZIP" ] && break
+          done
+          if [ -z "$ZIP" ]; then
+            ZIP=$(ls -1 work/tools/*.zip 2>/dev/null | grep -v net472 | head -n1)
+          fi
+          if [ -z "$ZIP" ]; then
+            echo "Il2CppDumper: release asset not found" > out/il2cpp-summary.txt
+            exit 0
+          fi
+          unzip -q -o "$ZIP" -d work/tools/dumper
+          DUMPER=$(find work/tools/dumper -name Il2CppDumper.dll | head -n1)
+          if [ -z "$DUMPER" ]; then
+            echo "Il2CppDumper: Il2CppDumper.dll not found in $ZIP" > out/il2cpp-summary.txt
+            exit 0
+          fi
+
+          # Disable the "press any key" prompt so it does not crash without a TTY.
+          CFG="$(dirname "$DUMPER")/config.json"
+          if [ -f "$CFG" ]; then
+            jq '.RequireAnyKey=false' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+          fi
+
+          export DOTNET_ROLL_FORWARD=Major
+          dotnet "$DUMPER" "$SO" "$META" "$PWD/work/dump" < /dev/null > out/il2cppdumper.log 2>&1
+
+          if [ -f work/dump/dump.cs ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            TYPES=$(grep -c ' // TypeDefIndex: ' work/dump/dump.cs)
+            {
+              echo "Il2CppDumper: OK ($(basename "$ZIP"))"
+              echo "Types in dump.cs: $TYPES"
+              echo "Images:"
+              grep -aE '^// Image [0-9]+:' work/dump/dump.cs | head -n 20 | sed 's|^// Image [0-9]*: |  - |'
+            } > out/il2cpp-summary.txt
+          else
+            echo "Il2CppDumper: FAILED. See il2cppdumper.log (metadata may be encrypted or libil2cpp.so protected)." > out/il2cpp-summary.txt
+            tail -n 15 out/il2cppdumper.log >> out/il2cpp-summary.txt
+          fi
+
+      - name: Build report
+        if: always()
+        run: |
+          mkdir -p out
+          [ -f work/info.env ] && source work/info.env
+          LIBS=$(cut -f1 out/native-libs.txt 2>/dev/null | sed 's|.*/||' | sort -u | paste -sd' ' -)
+          {
+            echo "## Bearite inspect report"
+            echo
+            echo "- **File:** ${FILE:-?} ($((SIZE/1024/1024)) MB)"
+            echo "- **SHA-256:** ${SHA:-?}"
+            echo "- **Package:** ${PKG:-?}"
+            echo "- **Game version:** ${VNAME:-?} (code ${VCODE:-?})"
+            echo "- **minSdk / targetSdk:** ${MINSDK:-?} / ${TGTSDK:-?}"
+            echo "- **Unity:** ${UV:-not detected} [${UVSRC:-n/a}]"
+            echo "- **Backend:** ${BACKEND:-?}"
+            echo "- **Backend details:** ${DETAIL:-n/a}"
+            echo "- **ABIs (lib/):** ${ABIS:-none}"
+            echo "- **ABIs (manifest):** ${NC:-not declared}"
+            echo "- **Launcher activity:** ${LAUNCH:-?}"
+            echo "- **Java entry base:** UnityPlayerActivity in ${UPA:-0} dex, UnityPlayerGameActivity in ${UPG:-0} dex (dex files: ${DEXN:-0})"
+            echo "- **Signature:** $(paste -sd' ' out/signature.txt 2>/dev/null)"
+            echo "- **Native libs:** ${LIBS:-none}"
+            [ -n "${WARN:-}" ] && echo "- **Warnings:**${WARN}"
+            if [ -s out/managed-dlls.txt ]; then
+              echo "- **Managed DLLs:** $(wc -l < out/managed-dlls.txt) files, see managed-dlls.txt"
+            fi
+            if [ -f out/il2cpp-summary.txt ]; then
+              echo
+              echo "### IL2CPP"
+              echo '```'
+              cat out/il2cpp-summary.txt
+              echo '```'
+            fi
+          } > out/report.md
+
+          jq -n \
+            --arg file "${FILE:-}" --arg sha "${SHA:-}" --arg pkg "${PKG:-}" \
+            --arg vname "${VNAME:-}" --arg vcode "${VCODE:-}" \
+            --arg unity "${UV:-}" --arg backend "${BACKEND:-}" \
+            --arg abis "${ABIS:-}" --arg launch "${LAUNCH:-}" \
+            '{file:$file, sha256:$sha, package:$pkg, versionName:$vname, versionCode:$vcode, unity:$unity, backend:$backend, abis:$abis, launcher:$launch}' \
+            > out/report.json
+
+          cat out/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-report
+          path: out/
+          if-no-files-found: ignore
+
+      - name: Upload IL2CPP dump
+        if: steps.dump.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: il2cpp-dump
+          path: |
+            work/dump/dump.cs
+            work/dump/script.json
+            work/dump/DummyDll
+          retention-days: 7
+          if-no-files-found: ignore
