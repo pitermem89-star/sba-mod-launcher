@@ -1,4 +1,4 @@
-name: Build SBA Geode Launcher
+name: Build Bearite Launcher
 
 on:
   push:
@@ -25,10 +25,9 @@ jobs:
 
     - name: Create Android Build Structure
       run: |
-        mkdir -p app/src/main/java/com/example/sbageode
+        mkdir -p app/src/main/java/com/pitermem/bearite
         mkdir -p app/src/main/cpp
         
-        # Создаем конфигурацию плагина Android Gradle
         cat << 'EOF' > build.gradle
         buildscript {
             repositories { google(); mavenCentral() }
@@ -46,10 +45,10 @@ jobs:
             id 'com.android.application'
         }
         android {
-            namespace 'com.example.sbageode'
+            namespace 'com.pitermem.bearite'
             compileSdk 34
             defaultConfig {
-                applicationId "com.example.sbageode"
+                applicationId "com.pitermem.bearite"
                 minSdk 24
                 targetSdk 34
                 versionCode 1
@@ -71,15 +70,14 @@ jobs:
             }
         }
         dependencies {
-            // Базовая библиотека для интерфейса Android
             implementation 'androidx.appcompat:appcompat:1.6.1'
         }
         EOF
 
         cat << 'EOF' > app/src/main/AndroidManifest.xml
-        <manifest xmlns:android="http://android.com" package="com.example.sbageode">
+        <manifest xmlns:android="http://android.com" package="com.pitermem.bearite">
             <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
-            <application android:allowBackup="true" android:label="SBA Geode Launcher" android:theme="@style/Theme.AppCompat.NoActionBar">
+            <application android:allowBackup="true" android:label="Bearite" android:theme="@style/Theme.AppCompat.NoActionBar">
                 <activity android:name=".LauncherActivity" android:exported="true">
                     <intent-filter>
                         <action android:name="android.intent.action.MAIN" />
@@ -92,25 +90,24 @@ jobs:
 
         cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
         cmake_minimum_required(VERSION 3.22.1)
-        project("sba_geode_core")
-        add_library(sba_geode_core SHARED native-lib.cpp)
+        project("bearite_core")
+        add_library(bearite_core SHARED native-lib.cpp)
         find_library(log-lib log)
-        target_link_libraries(sba_geode_core ${log-lib})
+        target_link_libraries(bearite_core ${log-lib})
         EOF
 
-        # Создаем дефолтные файлы, чтобы сборка не падала, если вы их еще не закинули в корень
-        cat << 'EOF' > app/src/main/java/com/example/sbageode/LauncherActivity.java
-        package com.example.sbageode;
+        cat << 'EOF' > app/src/main/java/com/pitermem/bearite/LauncherActivity.java
+        package com.pitermem.bearite;
         import android.os.Bundle;
         import android.widget.Button;
         import androidx.appcompat.app.AppCompatActivity;
         public class LauncherActivity extends AppCompatActivity {
-            static { System.loadLibrary("sba_geode_core"); }
+            static { System.loadLibrary("bearite_core"); }
             @Override
             protected void onCreate(Bundle savedInstanceState) {
                 super.onCreate(savedInstanceState);
                 Button btn = new Button(this);
-                btn.setText("SBA Geode Launcher Started");
+                btn.setText("Bearite Launcher Started");
                 setContentView(btn);
             }
         }
@@ -119,20 +116,19 @@ jobs:
         cat << 'EOF' > app/src/main/cpp/native-lib.cpp
         #include <jni.h>
         extern "C" JNIEXPORT jstring JNICALL
-        Java_com_example_sbageode_LauncherActivity_stringFromJNI(JNIEnv* env, jobject thiz) {
-            return env->NewStringUTF("Hello from C++ core");
+        Java_com_pitermem_bearite_LauncherActivity_stringFromJNI(JNIEnv* env, jobject thiz) {
+            return env->NewStringUTF("Hello from Bearite Core");
         }
         EOF
 
     - name: Build Launcher APK
       run: |
-        # Жестко заставляем GitHub использовать стабильный Gradle 8.5 вместо ломающего 9.7
         gradle wrapper --gradle-version 8.5
         ./gradlew assembleDebug
 
     - name: Upload Output APK
       uses: actions/upload-artifact@v4
       with:
-        name: sba-launcher-app
+        name: bearite-launcher-app
         path: app/build/outputs/apk/debug/app-debug.apk
         
