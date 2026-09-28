@@ -29,9 +29,6 @@ jobs:
 
       - name: Align and sign
         run: |
-          BT=$PWD/android-sdk/build-tools/34.0.0
           mkdir -p signed
-          for f in apks/*.apk; do
-            n=$(basename "$f")
-            $BT/zipalign -f -p 4 "$f" "aligned-$n"
-            $BT/ap
+          for f in apks/*.apk; do n=$(basename "$f"); $PWD/android-sdk/build-tools/34.0.0/zipalign -f -p 4 "$f" "aligned-$n"; $PWD/android-sdk/build-tools/34.0.0/apksigner sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out "signed/$n" "aligned-$n"; done
+          ls -la signed
