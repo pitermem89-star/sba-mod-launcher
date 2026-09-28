@@ -28,14 +28,16 @@ jobs:
         mkdir -p app/src/main/java/com/example/sbageode
         mkdir -p app/src/main/cpp
         
-        # Создаем build.gradle без использования \n
-        echo "buildscript {" > build.gradle
-        echo "    repositories { google(); mavenCentral() }" >> build.gradle
-        echo "    dependencies { classpath 'com.android.tools.build:gradle:8.1.4' }" >> build.gradle
-        echo "}" >> build.gradle
-        echo "allprojects {" >> build.gradle
-        echo "    repositories { google(); mavenCentral() }" >> build.gradle
-        echo "}" >> build.gradle
+        # Создаем конфигурацию плагина Android Gradle
+        cat << 'EOF' > build.gradle
+        buildscript {
+            repositories { google(); mavenCentral() }
+            dependencies { classpath 'com.android.tools.build:gradle:8.2.2' }
+        }
+        allprojects {
+            repositories { google(); mavenCentral() }
+        }
+        EOF
 
         echo "include ':app'" > settings.gradle
 
@@ -69,6 +71,7 @@ jobs:
             }
         }
         dependencies {
+            // Базовая библиотека для интерфейса Android
             implementation 'androidx.appcompat:appcompat:1.6.1'
         }
         EOF
@@ -95,13 +98,36 @@ jobs:
         target_link_libraries(sba_geode_core ${log-lib})
         EOF
 
-        # Перемещаем ваши файлы из корня (если они есть)
-        [ -f LauncherActivity.java ] && mv LauncherActivity.java app/src/main/java/com/example/sbageode/LauncherActivity.java || echo "Файл LauncherActivity отсутствует, создаем дефолтный"
-        [ -f native-lib.cpp ] && mv native-lib.cpp app/src/main/cpp/native-lib.cpp || echo "Файл native-lib.cpp отсутствует, создаем дефолтный"
+        # Создаем дефолтные файлы, чтобы сборка не падала, если вы их еще не закинули в корень
+        cat << 'EOF' > app/src/main/java/com/example/sbageode/LauncherActivity.java
+        package com.example.sbageode;
+        import android.os.Bundle;
+        import android.widget.Button;
+        import androidx.appcompat.app.AppCompatActivity;
+        public class LauncherActivity extends AppCompatActivity {
+            static { System.loadLibrary("sba_geode_core"); }
+            @Override
+            protected void onCreate(Bundle savedInstanceState) {
+                super.onCreate(savedInstanceState);
+                Button btn = new Button(this);
+                btn.setText("SBA Geode Launcher Started");
+                setContentView(btn);
+            }
+        }
+        EOF
+
+        cat << 'EOF' > app/src/main/cpp/native-lib.cpp
+        #include <jni.h>
+        extern "C" JNIEXPORT jstring JNICALL
+        Java_com_example_sbageode_LauncherActivity_stringFromJNI(JNIEnv* env, jobject thiz) {
+            return env->NewStringUTF("Hello from C++ core");
+        }
+        EOF
 
     - name: Build Launcher APK
       run: |
-        gradle wrapper
+        # Жестко заставляем GitHub использовать стабильный Gradle 8.5 вместо ломающего 9.7
+        gradle wrapper --gradle-version 8.5
         ./gradlew assembleDebug
 
     - name: Upload Output APK
