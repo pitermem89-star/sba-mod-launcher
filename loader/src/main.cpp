@@ -1,29 +1,38 @@
 // Bearite loader entry point. Runs when the game calls System.loadLibrary("bearite").
 #include <dlfcn.h>
 #include <jni.h>
-#include <setjmp.h>
-#include <signal.h>
-#include <string.h>
-#include <sys/syscall.h>
-#include <unistd.h>
 
+#include <algorithm>
 #include <deque>
 #include <set>
 
 #include "abi.h"
+#include "guard.hpp"
 #include "log.hpp"
 #include "mods.hpp"
+#include "runtime.hpp"
+#include "settings.hpp"
 
 namespace {
 
 using namespace bearite;
 
 constexpr const char* kTag = "loader";
-constexpr const char* kLoaderVersion = "0.1.0";
+constexpr const char* kLoaderVersion = "0.2.0";
 
-// Kept alive for the whole process: mods may keep pointers into them.
+// One loaded mod. Lives for the whole process: the mod keeps a pointer to `api`.
+struct Loaded {
+  Mod* mod;
+  BeariteApi api{};
+  BeariteOnUpdateFn on_update = nullptr;
+  BeariteOnUnloadFn on_unload = nullptr;
+  Settings settings;
+  bool active = true;
+  explicit Loaded(Mod* m) : mod(m), settings(m->dir / "settings.json") {}
+};
+
 std::vector<Mod> g_mods;
-std::deque<BeariteApi> g_apis;
+std::deque<Loaded> g_loaded;
 std::string g_game_version;
 
 // ---------------------------------------------------------------- JNI helpers
@@ -46,7 +55,6 @@ std::string to_string(JNIEnv* env, jstring s) {
   return out;
 }
 
-// java.io.File -> absolute path ("" if null)
 std::string file_path(JNIEnv* env, jobject file) {
   if (!file) return "";
   jclass cls = env->FindClass("java/io/File");
@@ -56,7 +64,6 @@ std::string file_path(JNIEnv* env, jobject file) {
   return to_string(env, s);
 }
 
-// Reads package name, game versionName and app folders from the running app.
 bool query_app_info(JNIEnv* env, AppInfo& info) {
   if (env->PushLocalFrame(64) != 0) return false;
   do {
@@ -104,68 +111,122 @@ bool query_app_info(JNIEnv* env, AppInfo& info) {
   return !info.files_dir.empty();
 }
 
-// --------------------------------------------------------------- crash guard
-// Runs a mod's bearite_on_load so that a crash inside it disables only that
-// mod. Only protects the calling thread and only during this call.
+// ------------------------------------------------------------- API for mods
 
-constexpr int kSignals[] = {SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGFPE};
-constexpr int kSignalCount = sizeof(kSignals) / sizeof(kSignals[0]);
-
-sigjmp_buf* g_jump = nullptr;
-long g_guard_tid = 0;
-
-void crash_handler(int sig) {
-  if (g_jump && syscall(SYS_gettid) == g_guard_tid) siglongjmp(*g_jump, sig);
-  signal(sig, SIG_DFL);  // crash on another thread: behave as without guard
-  raise(sig);
+Loaded* self(const BeariteApi* api) {
+  return api ? static_cast<Loaded*>(api->internal) : nullptr;
 }
-
-int run_on_load(BeariteOnLoadFn fn, const BeariteApi* api, int* result) {
-  try {
-    *result = fn(api);
-    return 0;
-  } catch (...) {
-    return -1;
-  }
-}
-
-// Returns 0 if the call finished, -1 on C++ exception, >0 = signal number.
-int call_guarded(BeariteOnLoadFn fn, const BeariteApi* api, int* result) {
-  struct sigaction sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_handler = crash_handler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_NODEFER;
-  struct sigaction old[kSignalCount];
-  for (int i = 0; i < kSignalCount; ++i) sigaction(kSignals[i], &sa, &old[i]);
-
-  sigjmp_buf jump;
-  g_jump = &jump;
-  g_guard_tid = syscall(SYS_gettid);
-  int sig = sigsetjmp(jump, 1);
-  if (sig == 0) sig = run_on_load(fn, api, result);
-  g_jump = nullptr;
-
-  for (int i = 0; i < kSignalCount; ++i) sigaction(kSignals[i], &old[i], nullptr);
-  return sig;
-}
-
-// ------------------------------------------------------------------- loading
 
 void api_log(int level, const char* tag, const char* msg) {
   Logger::get().write(level, tag ? tag : "mod", msg ? msg : "");
 }
 
-const BeariteApi* make_api(const Mod& mod) {
-  BeariteApi api{};
-  api.abi_version = BEARITE_ABI_VERSION;
-  api.struct_size = sizeof(BeariteApi);
-  api.game_version = g_game_version.c_str();
-  api.mod_dir = mod.dir.c_str();
-  api.log = api_log;
-  g_apis.push_back(api);
-  return &g_apis.back();
+int api_hook_method(const BeariteApi* api, const char* assembly, const char* ns,
+                    const char* klass, const char* method, int argc, void* replacement,
+                    void** out_original) {
+  Loaded* l = self(api);
+  if (!l) return 0;
+  return Runtime::get().add_hook(l->mod->id, assembly, ns, klass, method, argc, replacement,
+                                 out_original);
 }
+
+void* api_find_method(const BeariteApi*, const char* assembly, const char* ns,
+                      const char* klass, const char* method, int argc) {
+  return Runtime::get().find_method(assembly, ns, klass, method, argc);
+}
+
+int api_il2cpp_ready(const BeariteApi*) { return Runtime::get().ready() ? 1 : 0; }
+
+int api_get_setting(const BeariteApi* api, const char* key, const char* def, char* out,
+                    uint32_t out_size) {
+  Loaded* l = self(api);
+  if (!l || !key || !out || out_size == 0) return 0;
+  std::string value;
+  bool found = l->settings.get(key, value);
+  if (!found) value = def ? def : "";
+  size_t n = std::min<size_t>(value.size(), out_size - 1);
+  memcpy(out, value.data(), n);
+  out[n] = '\0';
+  return found ? 1 : 0;
+}
+
+int api_set_setting(const BeariteApi* api, const char* key, const char* value) {
+  Loaded* l = self(api);
+  if (!l || !key) return 0;
+  return l->settings.set(key, value ? value : "") ? 1 : 0;
+}
+
+void fill_api(Loaded& l) {
+  BeariteApi& a = l.api;
+  a.abi_version = BEARITE_ABI_VERSION;
+  a.struct_size = sizeof(BeariteApi);
+  a.game_version = g_game_version.c_str();
+  a.mod_dir = l.mod->dir.c_str();
+  a.log = api_log;
+  a.internal = &l;
+  a.hook_method = api_hook_method;
+  a.find_method = api_find_method;
+  a.il2cpp_ready = api_il2cpp_ready;
+  a.get_setting = api_get_setting;
+  a.set_setting = api_set_setting;
+}
+
+// ------------------------------------------------- guarded calls into mod code
+
+struct LoadCall {
+  BeariteOnLoadFn fn;
+  const BeariteApi* api;
+  int result;
+};
+void do_on_load(void* p) {
+  auto* c = static_cast<LoadCall*>(p);
+  c->result = c->fn(c->api);
+}
+
+struct UpdateCall {
+  BeariteOnUpdateFn fn;
+  float dt;
+};
+void do_on_update(void* p) {
+  auto* c = static_cast<UpdateCall*>(p);
+  c->fn(c->dt);
+}
+
+struct UnloadCall {
+  BeariteOnUnloadFn fn;
+};
+void do_on_unload(void* p) { static_cast<UnloadCall*>(p)->fn(); }
+
+std::string describe(int r) {
+  return r < 0 ? "threw a C++ exception" : "crashed (signal " + std::to_string(r) + ")";
+}
+
+// Turns a mod off after a runtime error: removes its hooks, calls on_unload.
+void disable_mod(Loaded& l, const std::string& why) {
+  if (!l.active) return;
+  l.active = false;
+  l.mod->enabled = false;
+  l.mod->reason = why;
+  BLOG_E(kTag, "disabling %s: %s", l.mod->id.c_str(), why.c_str());
+  Runtime::get().remove_hooks(l.mod->id);
+  if (l.on_unload) {
+    UnloadCall call{l.on_unload};
+    guarded_call(do_on_unload, &call);
+  }
+}
+
+// Called every frame by the runtime.
+void dispatch_update(float dt) {
+  guard_detail::Scope scope;
+  for (Loaded& l : g_loaded) {
+    if (!l.active || !l.on_update) continue;
+    UpdateCall call{l.on_update, dt};
+    int r = guarded_call(do_on_update, &call);
+    if (r != 0) disable_mod(l, "on_update " + describe(r));
+  }
+}
+
+// ------------------------------------------------------------------- loading
 
 bool make_dirs(const fs::path& p) {
   std::error_code ec;
@@ -173,9 +234,7 @@ bool make_dirs(const fs::path& p) {
   return fs::is_directory(p, ec);
 }
 
-// Copies the mod library to the app's private folder, dlopens it and calls
-// bearite_on_load. Returns false and sets `error` on any problem.
-bool load_mod(const Mod& mod, const fs::path& cache_dir, std::string& error) {
+bool load_mod(Mod& mod, const fs::path& cache_dir, std::string& error) {
   std::error_code ec;
   fs::path src = mod.dir / mod.library;
   if (!fs::is_regular_file(src, ec)) {
@@ -207,18 +266,19 @@ bool load_mod(const Mod& mod, const fs::path& cache_dir, std::string& error) {
     return false;
   }
 
-  int result = 0;
-  int sig = call_guarded(on_load, make_api(mod), &result);
-  if (sig < 0) {
-    error = "bearite_on_load threw a C++ exception";
-    return false;
-  }
-  if (sig > 0) {
-    error = "bearite_on_load crashed (signal " + std::to_string(sig) + ")";
-    return false;  // not dlclosed on purpose: the library is in an unknown state
-  }
-  if (result != 0) {
-    error = "bearite_on_load returned " + std::to_string(result);
+  g_loaded.emplace_back(&mod);
+  Loaded& l = g_loaded.back();
+  l.on_update = reinterpret_cast<BeariteOnUpdateFn>(dlsym(handle, "bearite_on_update"));
+  l.on_unload = reinterpret_cast<BeariteOnUnloadFn>(dlsym(handle, "bearite_on_unload"));
+  fill_api(l);
+
+  LoadCall call{on_load, &l.api, 0};
+  int r = guarded_call(do_on_load, &call);
+  if (r != 0 || call.result != 0) {
+    error = r != 0 ? "bearite_on_load " + describe(r)
+                   : "bearite_on_load returned " + std::to_string(call.result);
+    l.active = false;
+    Runtime::get().remove_hooks(mod.id);  // drop hooks it queued before failing
     return false;
   }
   return true;
@@ -309,8 +369,13 @@ void start(JavaVM* vm) {
   }
   for (const Mod& m : g_mods)
     if (!m.enabled) BLOG_W(kTag, "disabled: %s: %s", m.id.c_str(), m.reason.c_str());
-
   BLOG_I(kTag, "done: %zu of %zu mods loaded", loaded.size(), g_mods.size());
+
+  // 4. Hooks and on_update need the game's IL2CPP runtime: wait for it in the background.
+  if (!loaded.empty()) {
+    Runtime::get().set_update_callback(dispatch_update);
+    Runtime::get().start_watcher();
+  }
 }
 
 }  // namespace
