@@ -1,0 +1,114 @@
+name: Build SBA Geode Launcher
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - name: Install Android NDK
+      run: |
+        echo "y" | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --install "ndk;25.1.8937393" "cmake;3.22.1"
+
+    - name: Create Android Build Structure
+      run: |
+        # Автоматически создаем правильную структуру папок Android из корневых файлов
+        mkdir -p app/src/main/java/com/example/sbageode
+        mkdir -p app/src/main/cpp
+        
+        # Переносим или создаем файлы конфигурации Gradle
+        cat << 'EOF' > build.gradle
+        buildscript {
+            repositories { google() \n mavenCentral() }
+            dependencies { classpath 'com.android.tools.build:gradle:8.1.4' }
+        }
+        allprojects {
+            repositories { google() \n mavenCentral() }
+        }
+        EOF
+
+        cat << 'EOF' > settings.gradle
+        include ':app'
+        EOF
+
+        cat << 'EOF' > app/build.gradle
+        plugins {
+            id 'com.android.application'
+        }
+        android {
+            namespace 'com.example.sbageode'
+            compileSdk 34
+            defaultConfig {
+                applicationId "com.example.sbageode"
+                minSdk 24
+                targetSdk 34
+                versionCode 1
+                versionName "1.0"
+                externalNativeBuild {
+                    cmake { cppFlags "-std=c++17" }
+                }
+            }
+            buildTypes {
+                release {
+                    minifyEnabled false
+                }
+            }
+            externalNativeBuild {
+                cmake {
+                    path "src/main/cpp/CMakeLists.txt"
+                    version "3.22.1"
+                }
+            }
+        }
+        EOF
+
+        cat << 'EOF' > app/src/main/AndroidManifest.xml
+        <manifest xmlns:android="http://android.com" package="com.example.sbageode">
+            <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+            <application android:allowBackup="true" android:label="SBA Geode Launcher" android:theme="@style/Theme.AppCompat.NoActionBar">
+                <activity android:name=".LauncherActivity" android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+            </application>
+        </manifest>
+        EOF
+
+        cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
+        cmake_minimum_required(VERSION 3.22.1)
+        project("sba_geode_core")
+        add_library(sba_geode_core SHARED native-lib.cpp)
+        find_library(log-lib log)
+        target_link_libraries(sba_geode_core ${log-lib})
+        EOF
+
+        # Перемещаем ваши корневые файлы кода в нужные для сборки папки
+        [ -f LauncherActivity.java ] && mv LauncherActivity.java app/src/main/java/com/example/sbageode/LauncherActivity.java || echo "LauncherActivity.java не найден в корне"
+        [ -f native-lib.cpp ] && mv native-lib.cpp app/src/main/cpp/native-lib.cpp || echo "native-lib.cpp не найден в корне"
+
+    - name: Build Launcher APK
+      run: |
+        chmod +x gradlew || gradle wrapper
+        ./gradlew assembleDebug
+
+    - name: Upload Output APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: sba-launcher-app
+        path: app/build/outputs/apk/debug/app-debug.apk
+        
