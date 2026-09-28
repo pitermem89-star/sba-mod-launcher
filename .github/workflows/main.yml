@@ -4,27 +4,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  patch:
+  sign:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download files
-        run: |
-          curl -L -o base.apk https://github.com/${{ github.repository }}/releases/download/v1/base.apk
-          curl -L -o split_config.arm64_v8a.apk https://github.com/${{ github.repository }}/releases/download/v1/split_config.arm64_v8a.apk
-          curl -L -o split_gpdeku.apk https://github.com/${{ github.repository }}/releases/download/v1/split_gpdeku.apk
-          curl -L -o split_gpdeku.config.arm64_v8a.apk https://github.com/${{ github.repository }}/releases/download/v1/split_gpdeku.config.arm64_v8a.apk
-
-      - name: Replace libmain.so
-        run: |
-          sudo apt-get install -y zip unzip
-          mkdir extracted
-          cd extracted
-          unzip -o ../split_config.arm64_v8a.apk -d .
-          cp ../libmain.so lib/arm64-v8a/libmain.so
-          zip -r -X -0 ../split_config.arm64_v8a.patched.apk .
-          cd ..
+      - name: Download release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download v1 --repo ${{ github.repository }} --dir apks --pattern "*.apk"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -38,31 +24,14 @@ jobs:
           unzip -o cmdline-tools.zip -d cmdline-tools
           yes | cmdline-tools/cmdline-tools/bin/sdkmanager --sdk_root=$PWD/android-sdk "build-tools;34.0.0"
 
-      - name: Zipalign all apks
-        run: |
-          ZIPALIGN=android-sdk/build-tools/34.0.0/zipalign
-          $ZIPALIGN -f -p 4 base.apk base.aligned.apk
-          $ZIPALIGN -f -p 4 split_config.arm64_v8a.patched.apk split_config.arm64_v8a.aligned.apk
-          $ZIPALIGN -f -p 4 split_gpdeku.apk split_gpdeku.aligned.apk
-          $ZIPALIGN -f -p 4 split_gpdeku.config.arm64_v8a.apk split_gpdeku.config.arm64_v8a.aligned.apk
-
       - name: Generate key
-        run: keytool -genkeypair -v -keystore my-key.jks -keyalg RSA -keysize 2048 -validity 10000 -alias mykey -storepass 123456 -keypass 123456 -dname "CN=sba"
+        run: keytool -genkeypair -keystore my-key.jks -keyalg RSA -keysize 2048 -validity 10000 -alias mykey -storepass 123456 -keypass 123456 -dname "CN=sba"
 
-      - name: Sign all apks
+      - name: Align and sign
         run: |
-          SIGNER=android-sdk/build-tools/34.0.0/apksigner
-          $SIGNER sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out base-signed.apk base.aligned.apk
-          $SIGNER sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out split_config.arm64_v8a-signed.apk split_config.arm64_v8a.aligned.apk
-          $SIGNER sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out split_gpdeku-signed.apk split_gpdeku.aligned.apk
-          $SIGNER sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out split_gpdeku.config.arm64_v8a-signed.apk split_gpdeku.config.arm64_v8a.aligned.apk
-
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: patched-apks
-          path: |
-            base-signed.apk
-            split_config.arm64_v8a-signed.apk
-            split_gpdeku-signed.apk
-            split_gpdeku.config.arm64_v8a-signed.apk
+          BT=$PWD/android-sdk/build-tools/34.0.0
+          mkdir -p signed
+          for f in apks/*.apk; do
+            n=$(basename "$f")
+            $BT/zipalign -f -p 4 "$f" "aligned-$n"
+            $BT/ap
