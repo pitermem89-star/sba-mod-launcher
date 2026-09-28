@@ -43,4 +43,15 @@ inline void* find_method(const char* assembly, const char* ns, const char* klass
 }
 
 inline std::string setting(const char* key, const char* fallback = "") {
-  if (!BEARI
+  if (!BEARITE_API_HAS(api(), get_setting)) return fallback;
+  char buf[512];
+  api()->get_setting(api(), key, fallback, buf, sizeof(buf));
+  return buf;
+}
+
+inline bool set_setting(const char* key, const char* value) {
+  if (!BEARITE_API_HAS(api(), set_setting)) return false;
+  return api()->set_setting(api(), key, value) != 0;
+}
+
+}  // namespace bearite
