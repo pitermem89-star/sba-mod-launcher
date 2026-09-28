@@ -1,0 +1,14 @@
+# Never commit game files or secrets
+*.apk
+*.xapk
+*.apks
+*.obb
+*.so
+*.keystore
+*.jks
+
+# Workflow scratch
+work/
+out/
+DummyDll/
+dump.cs
