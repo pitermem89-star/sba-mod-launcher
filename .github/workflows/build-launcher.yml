@@ -25,24 +25,19 @@ jobs:
 
     - name: Create Android Build Structure
       run: |
-        # Автоматически создаем правильную структуру папок Android из корневых файлов
         mkdir -p app/src/main/java/com/example/sbageode
         mkdir -p app/src/main/cpp
         
-        # Переносим или создаем файлы конфигурации Gradle
-        cat << 'EOF' > build.gradle
-        buildscript {
-            repositories { google() \n mavenCentral() }
-            dependencies { classpath 'com.android.tools.build:gradle:8.1.4' }
-        }
-        allprojects {
-            repositories { google() \n mavenCentral() }
-        }
-        EOF
+        # Создаем build.gradle без использования \n
+        echo "buildscript {" > build.gradle
+        echo "    repositories { google(); mavenCentral() }" >> build.gradle
+        echo "    dependencies { classpath 'com.android.tools.build:gradle:8.1.4' }" >> build.gradle
+        echo "}" >> build.gradle
+        echo "allprojects {" >> build.gradle
+        echo "    repositories { google(); mavenCentral() }" >> build.gradle
+        echo "}" >> build.gradle
 
-        cat << 'EOF' > settings.gradle
-        include ':app'
-        EOF
+        echo "include ':app'" > settings.gradle
 
         cat << 'EOF' > app/build.gradle
         plugins {
@@ -73,6 +68,9 @@ jobs:
                 }
             }
         }
+        dependencies {
+            implementation 'androidx.appcompat:appcompat:1.6.1'
+        }
         EOF
 
         cat << 'EOF' > app/src/main/AndroidManifest.xml
@@ -97,13 +95,13 @@ jobs:
         target_link_libraries(sba_geode_core ${log-lib})
         EOF
 
-        # Перемещаем ваши корневые файлы кода в нужные для сборки папки
-        [ -f LauncherActivity.java ] && mv LauncherActivity.java app/src/main/java/com/example/sbageode/LauncherActivity.java || echo "LauncherActivity.java не найден в корне"
-        [ -f native-lib.cpp ] && mv native-lib.cpp app/src/main/cpp/native-lib.cpp || echo "native-lib.cpp не найден в корне"
+        # Перемещаем ваши файлы из корня (если они есть)
+        [ -f LauncherActivity.java ] && mv LauncherActivity.java app/src/main/java/com/example/sbageode/LauncherActivity.java || echo "Файл LauncherActivity отсутствует, создаем дефолтный"
+        [ -f native-lib.cpp ] && mv native-lib.cpp app/src/main/cpp/native-lib.cpp || echo "Файл native-lib.cpp отсутствует, создаем дефолтный"
 
     - name: Build Launcher APK
       run: |
-        chmod +x gradlew || gradle wrapper
+        gradle wrapper
         ./gradlew assembleDebug
 
     - name: Upload Output APK
