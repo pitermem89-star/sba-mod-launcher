@@ -32,3 +32,8 @@ jobs:
           mkdir -p signed
           for f in apks/*.apk; do n=$(basename "$f"); $PWD/android-sdk/build-tools/34.0.0/zipalign -f -p 4 "$f" "aligned-$n"; $PWD/android-sdk/build-tools/34.0.0/apksigner sign --ks my-key.jks --ks-pass pass:123456 --key-pass pass:123456 --out "signed/$n" "aligned-$n"; done
           ls -la signed
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-apks
+          path: signed/*.apk
