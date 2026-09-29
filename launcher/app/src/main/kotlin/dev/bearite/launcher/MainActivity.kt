@@ -1,13 +1,15 @@
 package dev.bearite.launcher
 
 import android.app.Activity
+import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.widget.ScrollView
+import android.provider.MediaStore
+import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
 import java.io.File
-import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 
 class MainActivity : Activity() {
@@ -16,64 +18,64 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val text = TextView(this)
-        text.textSize = 13f
-        text.setPadding(40, 80, 40, 40)
-        text.setTextIsSelectable(true)
-        text.text = "Scanning..."
-        val scroll = ScrollView(this)
-        scroll.addView(text)
-        setContentView(scroll)
-        Thread {
-            val result = try {
-                describeGame()
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setPadding(40, 80, 40, 40)
+
+        val status = TextView(this)
+        status.textSize = 15f
+        status.text = gameInfo()
+
+        val button = Button(this)
+        button.text = "Export libmain.so to Downloads"
+        button.setOnClickListener {
+            status.text = try {
+                exportLibMain()
             } catch (e: Exception) {
                 "Error: $e"
             }
-            runOnUiThread { text.text = result }
-        }.start()
+        }
+
+        root.addView(button)
+        root.addView(status)
+        setContentView(root)
     }
 
-    private fun describeGame(): String {
-        val info = try {
-            packageManager.getPackageInfo(gamePackage, 0)
+    private fun gameInfo(): String {
+        return try {
+            val info = packageManager.getPackageInfo(gamePackage, 0)
+            "Game found: " + gamePackage + "\nVersion: " + info.versionName
         } catch (e: PackageManager.NameNotFoundException) {
-            return "Game not found: $gamePackage"
+            "Game not found: $gamePackage"
         }
-        val app = info.applicationInfo ?: return "No app info."
-        val sb = StringBuilder()
-        sb.append("Game ").append(info.versionName).append('\n')
-        sb.append("ABIs: ").append(Build.SUPPORTED_ABIS.joinToString()).append("\n\n")
-        val paths = ArrayList<String>()
-        paths.add(app.sourceDir)
-        app.splitSourceDirs?.let { paths.addAll(it) }
-        for (p in paths) scanApk(File(p), sb)
-        return sb.toString()
     }
 
-    private fun scanApk(file: File, sb: StringBuilder) {
-        sb.append("== ").append(file.name).append(" (")
-        sb.append(file.length() / 1024).append(" KB)\n")
-        try {
-            ZipFile(file).use { zip ->
-                var other = 0
-                val entries = zip.entries()
-                while (entries.hasMoreElements()) {
-                    val e = entries.nextElement()
-                    val n = e.name
-                    if (n.endsWith(".so") || n.endsWith(".dex") || n == "AndroidManifest.xml") {
-                        val m = if (e.method == ZipEntry.STORED) "STORED" else "DEFLATED"
-                        sb.append("  ").append(n).append("  ")
-                        sb.append(e.size / 1024).append("KB ").append(m).append('\n')
-                    } else {
-                        other++
-                    }
-                }
-                sb.append("  (+").append(other).append(" other files)\n")
+    private fun exportLibMain(): String {
+        if (Build.VERSION.SDK_INT < 29) return "Android 10+ required"
+        val info = packageManager.getPackageInfo(gamePackage, 0)
+        val app = info.applicationInfo ?: return "No app info"
+        val dirs = app.splitSourceDirs ?: return "No splits"
+        for (p in dirs) {
+            val zip = ZipFile(File(p))
+            val entry = zip.getEntry("lib/arm64-v8a/libmain.so")
+            if (entry == null) {
+                zip.close()
+                continue
             }
-        } catch (e: Exception) {
-            sb.append("  cannot read: ").append(e).append('\n')
+            val values = ContentValues()
+            values.put(MediaStore.Downloads.DISPLAY_NAME, "libmain.so")
+            values.put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            if (uri == null) {
+                zip.close()
+                return "Cannot create file"
+            }
+            contentResolver.openOutputStream(uri)?.use { out ->
+                zip.getInputStream(entry).use { it.copyTo(out) }
+            }
+            zip.close()
+            return "Saved libmain.so to Downloads"
         }
-        sb.append('\n')
+        return "libmain.so not found"
     }
 }
