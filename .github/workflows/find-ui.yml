@@ -6,7 +6,7 @@ on:
       release_tag:
         description: "Release tag that holds the APK file(s)"
         required: true
-        default: "apk-source"
+        default: "v1"
       extra_pattern:
         description: "Optional extra words for class names, separated by | (e.g. shop|lives)"
         required: false
@@ -84,7 +84,7 @@ jobs:
           dotnet "$DLL" "$IL2CPP_SO" "$METADATA" dump < /dev/null 2>&1 | tee out/il2cppdumper.log
           test -f dump/dump.cs
 
-      - name: Extract UI classes
+      - name: Extract game classes
         run: |
           set -eu
           DUMP=dump/dump.cs
@@ -94,34 +94,69 @@ jobs:
             LIST_RE="$LIST_RE|$EXTRA"
             BODY_RE="$BODY_RE|$EXTRA"
           fi
+          : > out/all_classes.txt
           : > out/ui_classes.txt
           : > out/ui_bodies.txt
+          : > out/game_dump.cs
 
-          # Only game code (Assembly-CSharp*): class list and full bodies (fields + method signatures)
-          awk -v list_re="$LIST_RE" -v body_re="$BODY_RE" '
-            /^\/\/ Image [0-9]+: / { img = $0; next }
+          grep -E '^// Image [0-9]+:' "$DUMP" > out/images.txt || true
+
+          # dump.cs lists all images once at the top; each class carries "TypeDefIndex: N".
+          # A class belongs to the last image whose start index is <= N.
+          awk -v list_re="$LIST_RE" -v body_re="$BODY_RE" \
+              -v f_all=out/all_classes.txt -v f_list=out/ui_classes.txt \
+              -v f_body=out/ui_bodies.txt -v f_game=out/game_dump.cs '
+            /^\/\/ Image [0-9]+: / {
+              line = $0
+              sub(/^\/\/ Image [0-9]+: /, "", line)
+              nm = line
+              sub(/ - [0-9]+$/, "", nm)
+              st = line
+              sub(/^.* - /, "", st)
+              cnt++
+              iname[cnt] = nm
+              istart[cnt] = st + 0
+              next
+            }
             /^\/\/ Namespace:/ { ns = $0; sub(/^\/\/ Namespace: ?/, "", ns); next }
             /^[a-z ]*(class|struct|interface) / {
-              cap = 0; n = 0
-              if (img !~ /Assembly-CSharp/) next
+              cap = 0; capall = 0; n = 0
+              if (match($0, /TypeDefIndex: [0-9]+/) == 0) next
+              idx = substr($0, RSTART + 14, RLENGTH - 14) + 0
+              owner = ""
+              for (i = cnt; i >= 1; i--) {
+                if (istart[i] <= idx) { owner = iname[i]; break }
+              }
+              if (owner !~ /^Assembly-CSharp/) next
               name = $0
               sub(/^[a-z ]*(class|struct|interface) /, "", name)
               sub(/[ <:{].*$/, "", name)
               lname = tolower(name)
-              if (lname ~ tolower(list_re)) print "[" ns "] " $0 >> "out/ui_classes.txt"
+              capall = 1
+              print "// Namespace: " ns >> f_game
+              print $0 >> f_game
+              print "[" ns "] " $0 >> f_all
+              if (lname ~ tolower(list_re)) print "[" ns "] " $0 >> f_list
               if (lname ~ tolower(body_re)) {
                 cap = 1
-                print "// Namespace: " ns >> "out/ui_bodies.txt"
-                print $0 >> "out/ui_bodies.txt"
+                print "// Namespace: " ns >> f_body
+                print $0 >> f_body
               }
               next
             }
-            cap && /^\}$/ { print "}" >> "out/ui_bodies.txt"; print "" >> "out/ui_bodies.txt"; cap = 0; next }
-            cap && /^\t\/\/ RVA:/ { next }
-            cap { if (n++ < 200) print $0 >> "out/ui_bodies.txt" }
+            (capall || cap) && /^\}$/ {
+              if (capall) { print "}" >> f_game; print "" >> f_game }
+              if (cap) { print "}" >> f_body; print "" >> f_body }
+              cap = 0; capall = 0
+              next
+            }
+            (capall || cap) && /^\t\/\/ RVA:/ { next }
+            {
+              if (capall) print $0 >> f_game
+              if (cap && n++ < 200) print $0 >> f_body
+            }
           ' "$DUMP"
 
-          grep -E '^// Image [0-9]+:' "$DUMP" > out/images.txt || true
           TMP_CNT=$(grep -cE '\bTextMeshPro(UGUI)?\b|\bTMP_Text\b' "$DUMP" || true)
           TEXT_CNT=$(grep -cE '^\s+(public|private|protected|internal) Text [A-Za-z_]+;' "$DUMP" || true)
           BTN_CNT=$(grep -cE '\bButton [A-Za-z_]+;' "$DUMP" || true)
@@ -129,14 +164,11 @@ jobs:
           {
             echo "## Bearite: UI class search"
             echo
+            echo "Game classes (Assembly-CSharp*): $(wc -l < out/all_classes.txt)"
+            echo
             echo "Approximate field counts in dump.cs: TextMeshPro=$TMP_CNT, legacy Text=$TEXT_CNT, Button=$BTN_CNT"
             echo
-            echo "### UI-related assemblies present in the game"
-            echo '```'
-            grep -E 'UI|TextMeshPro|Localiz|Input|Assembly-CSharp' out/images.txt || true
-            echo '```'
-            echo
-            echo "### Matching classes in Assembly-CSharp ($(wc -l < out/ui_classes.txt))"
+            echo "### Matching classes ($(wc -l < out/ui_classes.txt))"
             echo '```'
             head -n 200 out/ui_classes.txt
             echo '```'
@@ -149,7 +181,7 @@ jobs:
             echo "</details>"
           } | tee out/report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload report (without the full dump)
+      - name: Upload report
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
