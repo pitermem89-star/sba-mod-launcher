@@ -1,7 +1,0 @@
-{
-  "id": "mod-menu",
-  "name": "Mod Menu",
-  "version": "1.0.0",
-  "author": "you",
-  "library": "libmod-menu.so"
-}
