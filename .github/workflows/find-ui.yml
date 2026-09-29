@@ -1,0 +1,159 @@
+name: Find UI classes
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag that holds the APK file(s)"
+        required: true
+        default: "apk-source"
+      extra_pattern:
+        description: "Optional extra words for class names, separated by | (e.g. shop|lives)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  find-ui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.release_tag }}
+      EXTRA: ${{ inputs.extra_pattern }}
+    steps:
+      - name: Download and unpack APK(s)
+        run: |
+          set -eu
+          mkdir -p input work out dump
+          if ! gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.apk' --dir input; then
+            echo "::error::No .apk asset found in release '$TAG'"
+            exit 1
+          fi
+          for apk in input/*.apk; do
+            name=$(basename "$apk" .apk)
+            mkdir -p "work/$name"
+            unzip -q -o "$apk" -d "work/$name" || true
+          done
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run Il2CppDumper
+        run: |
+          set -euo pipefail
+          IL2CPP_SO=$(find work -type f -name libil2cpp.so | sort | grep -E '/arm64-v8a/' | head -n1 || true)
+          if [ -z "$IL2CPP_SO" ]; then
+            IL2CPP_SO=$(find work -type f -name libil2cpp.so | sort | head -n1 || true)
+          fi
+          METADATA=$(find work -type f -name global-metadata.dat | head -n1 || true)
+          if [ -z "$IL2CPP_SO" ] || [ -z "$METADATA" ]; then
+            echo "::error::libil2cpp.so or global-metadata.dat not found (is this a split APK? upload all parts)"
+            exit 1
+          fi
+
+          mkdir -p tools/dumper
+          gh api repos/Perfare/Il2CppDumper/releases/latest --jq '.assets[].name' > tools/assets.txt
+          ASSET=""
+          for n in 8 7 6; do
+            if [ -z "$ASSET" ]; then
+              ASSET=$(grep -iE "net${n}" tools/assets.txt | head -n1 || true)
+            fi
+          done
+          if [ -z "$ASSET" ]; then
+            echo "::error::No net6/net7/net8 build among Il2CppDumper release assets"
+            cat tools/assets.txt
+            exit 1
+          fi
+          gh release download --repo Perfare/Il2CppDumper --pattern "$ASSET" --dir tools/dumper
+          unzip -q "tools/dumper/$ASSET" -d tools/dumper/bin
+          DLL=$(find tools/dumper/bin -name Il2CppDumper.dll | head -n1 || true)
+          if [ -z "$DLL" ]; then
+            echo "::error::Il2CppDumper.dll not found in $ASSET"
+            exit 1
+          fi
+          CFG="$(dirname "$DLL")/config.json"
+          jq '.RequireAnyKey = false' "$CFG" > "$CFG.tmp"
+          mv "$CFG.tmp" "$CFG"
+
+          export DOTNET_ROLL_FORWARD=Major
+          dotnet "$DLL" "$IL2CPP_SO" "$METADATA" dump < /dev/null 2>&1 | tee out/il2cppdumper.log
+          test -f dump/dump.cs
+
+      - name: Extract UI classes
+        run: |
+          set -eu
+          DUMP=dump/dump.cs
+          LIST_RE='pause|mainmenu|menu|setting|option|popup|window|dialog|panel|screen|uimanager|localiz|shop|store|achievement|button|canvas|hud'
+          BODY_RE='pause|mainmenu|setting'
+          if [ -n "$EXTRA" ]; then
+            LIST_RE="$LIST_RE|$EXTRA"
+            BODY_RE="$BODY_RE|$EXTRA"
+          fi
+          : > out/ui_classes.txt
+          : > out/ui_bodies.txt
+
+          # Only game code (Assembly-CSharp*): class list and full bodies (fields + method signatures)
+          awk -v list_re="$LIST_RE" -v body_re="$BODY_RE" '
+            /^\/\/ Image [0-9]+: / { img = $0; next }
+            /^\/\/ Namespace:/ { ns = $0; sub(/^\/\/ Namespace: ?/, "", ns); next }
+            /^[a-z ]*(class|struct|interface) / {
+              cap = 0; n = 0
+              if (img !~ /Assembly-CSharp/) next
+              name = $0
+              sub(/^[a-z ]*(class|struct|interface) /, "", name)
+              sub(/[ <:{].*$/, "", name)
+              lname = tolower(name)
+              if (lname ~ tolower(list_re)) print "[" ns "] " $0 >> "out/ui_classes.txt"
+              if (lname ~ tolower(body_re)) {
+                cap = 1
+                print "// Namespace: " ns >> "out/ui_bodies.txt"
+                print $0 >> "out/ui_bodies.txt"
+              }
+              next
+            }
+            cap && /^\}$/ { print "}" >> "out/ui_bodies.txt"; print "" >> "out/ui_bodies.txt"; cap = 0; next }
+            cap && /^\t\/\/ RVA:/ { next }
+            cap { if (n++ < 200) print $0 >> "out/ui_bodies.txt" }
+          ' "$DUMP"
+
+          grep -E '^// Image [0-9]+:' "$DUMP" > out/images.txt || true
+          TMP_CNT=$(grep -cE '\bTextMeshPro(UGUI)?\b|\bTMP_Text\b' "$DUMP" || true)
+          TEXT_CNT=$(grep -cE '^\s+(public|private|protected|internal) Text [A-Za-z_]+;' "$DUMP" || true)
+          BTN_CNT=$(grep -cE '\bButton [A-Za-z_]+;' "$DUMP" || true)
+
+          {
+            echo "## Bearite: UI class search"
+            echo
+            echo "Approximate field counts in dump.cs: TextMeshPro=$TMP_CNT, legacy Text=$TEXT_CNT, Button=$BTN_CNT"
+            echo
+            echo "### UI-related assemblies present in the game"
+            echo '```'
+            grep -E 'UI|TextMeshPro|Localiz|Input|Assembly-CSharp' out/images.txt || true
+            echo '```'
+            echo
+            echo "### Matching classes in Assembly-CSharp ($(wc -l < out/ui_classes.txt))"
+            echo '```'
+            head -n 200 out/ui_classes.txt
+            echo '```'
+            echo
+            echo "<details><summary>Class bodies (first 500 lines)</summary>"
+            echo
+            echo '```'
+            head -n 500 out/ui_bodies.txt
+            echo '```'
+            echo "</details>"
+          } | tee out/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report (without the full dump)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bearite-ui-classes
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
