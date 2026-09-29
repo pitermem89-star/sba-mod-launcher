@@ -72,7 +72,9 @@ class Patcher(private val ctx: Context, private val log: (String) -> Unit) {
         val sources = sourceApks()
         for (s in sources) {
             if (hasEntry(s, LIB_MAIN_REAL)) {
-                throw IllegalStateException("The installed game is already patched.")
+                throw IllegalStateException(
+                    "The installed game is already patched. Uninstall it, install the original from Google Play, then patch."
+                )
             }
         }
         workDir.deleteRecursively()
@@ -88,6 +90,18 @@ class Patcher(private val ctx: Context, private val log: (String) -> Unit) {
                 log("Patching native libs in " + src.name + " ...")
                 input = File(workDir, "tmp_" + src.name)
                 rewriteNativeSplit(src, input)
+            } else if (hasEntry(src, "classes.dex")) {
+                val tmp = File(workDir, "tmp_" + src.name)
+                log("Copying " + src.name + " ...")
+                src.copyTo(tmp, true)
+                log("Removing license check in " + src.name + " ...")
+                val n = PairipPatch.patch(tmp)
+                log("Neutralized " + n + " methods in " + src.name)
+                if (n > 0) {
+                    input = tmp
+                } else {
+                    tmp.delete()
+                }
             }
             log("Signing " + src.name + " ...")
             val out = File(workDir, src.name)
