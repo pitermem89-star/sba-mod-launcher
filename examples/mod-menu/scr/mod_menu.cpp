@@ -59,6 +59,8 @@ struct Il2 {
   uint32_t (*gchandle_new)(void*, int);
   void (*gchandle_free)(uint32_t);
   size_t (*array_length)(void*);
+  void* (*object_new)(void*);
+  void* (*array_new)(void*, size_t);
   void* (*exception_message)(void*);  // not exported everywhere, optional
   bool ok = false;
 };
@@ -97,6 +99,8 @@ bool load_il2cpp() {
   sym("il2cpp_gchandle_new", g_il.gchandle_new);
   sym("il2cpp_gchandle_free", g_il.gchandle_free);
   sym("il2cpp_array_length", g_il.array_length);
+  sym("il2cpp_object_new", g_il.object_new);
+  sym("il2cpp_array_new", g_il.array_new);
   g_il.ok = all;
   return all;
 }
@@ -330,220 +334,129 @@ std::string mods_dir() {
   return s == std::string::npos ? d : d.substr(0, s);
 }
 
-std::string mod_list_text() {
-  std::string dir = mods_dir();
-  std::vector<std::string> lines;
-  if (DIR* d = opendir(dir.c_str())) {
+struct ModInfo {
+  std::string dir, name, version, author;
+};
+
+std::vector<ModInfo> scan_mods() {
+  std::string root = mods_dir();
+  std::vector<ModInfo> out;
+  if (DIR* d = opendir(root.c_str())) {
     while (dirent* e = readdir(d)) {
       if (e->d_name[0] == '.') continue;
-      std::string json = read_file(dir + "/" + e->d_name + "/mod.json");
+      std::string dir = root + "/" + e->d_name;
+      std::string json = read_file(dir + "/mod.json");
       if (json.empty()) continue;
-      std::string name = json_str(json, "name");
-      if (name.empty()) name = json_str(json, "id");
-      if (name.empty()) name = e->d_name;
-      std::string ver = json_str(json, "version");
-      std::string author = json_str(json, "author");
-      std::string line = "• " + name;
-      if (!ver.empty()) line += "  v" + ver;
-      if (!author.empty()) line += "  —  " + author;
-      lines.push_back(line);
+      ModInfo m;
+      m.dir = dir;
+      m.name = json_str(json, "name");
+      if (m.name.empty()) m.name = json_str(json, "id");
+      if (m.name.empty()) m.name = e->d_name;
+      m.version = json_str(json, "version");
+      m.author = json_str(json, "author");
+      out.push_back(m);
     }
     closedir(d);
   }
-  std::sort(lines.begin(), lines.end());
-  if (lines.empty()) return "Моды не найдены";
-  std::string out;
-  for (auto& l : lines) out += l + "\n";
+  std::sort(out.begin(), out.end(), [](const ModInfo& x, const ModInfo& y) { return x.name < y.name; });
   return out;
 }
 
 // ------------------------------------------------------------- state -------
 
+// ---- extra Unity glue for building the list UI from code
+
+struct V {
+  void *Image, *Graphic, *Sprite, *Texture, *Texture2D, *ImageConversion, *SystemType, *SystemByte;
+  void *m_go_ctor, *m_go_add_comp, *m_set_parent, *m_destroy;
+  void *m_amin, *m_amax, *m_omin, *m_omax, *m_pivot, *m_size;
+  void *m_set_color, *m_set_raycast, *m_set_sprite;
+  void *m_tmp_align, *m_tmp_size;
+  void *m_tex_ctor, *m_tex_w, *m_tex_h, *m_load_image, *m_sprite_create;
+  void *t_RectTransform, *t_Image, *t_Button;
+  bool ok = false;
+};
+V v;
+
+bool init_ui() {
+  if (v.ok) return true;
+  if (!init_unity()) return false;
+  v.Image = find_class(ASM_UI, "UnityEngine.UI", "Image");
+  v.Graphic = find_class(ASM_UI, "UnityEngine.UI", "Graphic");
+  v.Sprite = find_class(ASM_CORE, "UnityEngine", "Sprite");
+  v.Texture = find_class(ASM_CORE, "UnityEngine", "Texture");
+  v.Texture2D = find_class(ASM_CORE, "UnityEngine", "Texture2D");
+  v.ImageConversion = find_class("UnityEngine.ImageConversionModule", "UnityEngine", "ImageConversion");
+  v.SystemType = find_class("mscorlib", "System", "Type");
+  v.SystemByte = find_class("mscorlib", "System", "Byte");
+
+  v.m_go_ctor = find_method(u.GameObject, ".ctor", {"System.String", "System.Type[]"});
+  v.m_go_add_comp = find_method(u.GameObject, "AddComponent", {"System.Type"});
+  v.m_set_parent = find_method(u.Transform, "SetParent", {"UnityEngine.Transform", "System.Boolean"});
+  v.m_destroy = find_method(u.Object, "Destroy", {"UnityEngine.Object"});
+  v.m_amin = find_method(u.RectTransform, "set_anchorMin", {"UnityEngine.Vector2"});
+  v.m_amax = find_method(u.RectTransform, "set_anchorMax", {"UnityEngine.Vector2"});
+  v.m_omin = find_method(u.RectTransform, "set_offsetMin", {"UnityEngine.Vector2"});
+  v.m_omax = find_method(u.RectTransform, "set_offsetMax", {"UnityEngine.Vector2"});
+  v.m_pivot = find_method(u.RectTransform, "set_pivot", {"UnityEngine.Vector2"});
+  v.m_size = find_method(u.RectTransform, "set_sizeDelta", {"UnityEngine.Vector2"});
+  v.m_set_color = find_method(v.Graphic, "set_color", {"UnityEngine.Color"});
+  v.m_set_raycast = find_method(v.Graphic, "set_raycastTarget", {"System.Boolean"});
+  v.m_set_sprite = find_method(v.Image, "set_sprite", {"UnityEngine.Sprite"});
+  v.m_tmp_align = find_method(u.TMP_Text, "set_alignment", {"TMPro.TextAlignmentOptions"});
+  v.m_tmp_size = find_method(u.TMP_Text, "set_fontSize", {"System.Single"});
+
+  // Optional: custom mod icons (icon.png). Missing pieces just disable icons.
+  if (v.Texture2D) v.m_tex_ctor = find_method(v.Texture2D, ".ctor", {"System.Int32", "System.Int32"});
+  if (v.Texture) { v.m_tex_w = find_method(v.Texture, "get_width", {}); v.m_tex_h = find_method(v.Texture, "get_height", {}); }
+  if (v.ImageConversion) v.m_load_image = find_method(v.ImageConversion, "LoadImage", {"UnityEngine.Texture2D", "System.Byte[]"});
+  if (v.Sprite) v.m_sprite_create = find_method(v.Sprite, "Create", {"UnityEngine.Texture2D", "UnityEngine.Rect", "UnityEngine.Vector2"});
+
+  auto type_obj = [](void* k) { return k ? g_il.type_get_object(g_il.class_get_type(k)) : nullptr; };
+  v.t_RectTransform = type_obj(u.RectTransform);
+  v.t_Image = type_obj(v.Image);
+  v.t_Button = u.t_Button;
+
+  void* required[] = {v.SystemType, v.m_go_ctor, v.m_go_add_comp, v.m_set_parent, v.m_destroy, v.m_amin, v.m_amax,
+                      v.m_omin, v.m_omax, v.m_set_color, v.m_tmp_align, v.t_RectTransform, v.t_Image, v.t_Button};
+  for (void* r : required) if (!r) { bearite::log(BEARITE_LOG_ERROR, TAG, "UI glue incomplete, fancy list disabled"); return false; }
+  v.ok = true;
+  return true;
+}
+
+struct Vec2 { float x, y; };
+struct Color { float r, g, b, a; };
+
+void rect(void* tr, Vec2 amin, Vec2 amax, Vec2 omin = {0, 0}, Vec2 omax = {0, 0}) {
+  call(v.m_amin, tr, {&amin});
+  call(v.m_amax, tr, {&amax});
+  call(v.m_omin, tr, {&omin});
+  call(v.m_omax, tr, {&omax});
+}
+
+// new GameObject(name, typeof(RectTransform)) as a child of `parent_tr`.
+void* new_ui(const char* name, void* parent_tr) {
+  void* arr = g_il.array_new(v.SystemType, 1);
+  array_items(arr)[0] = v.t_RectTransform;
+  void* go = g_il.object_new(u.GameObject);
+  bool ok = false;
+  call(v.m_go_ctor, go, {il_str(name), arr}, &ok);
+  if (!ok) return nullptr;
+  void* tr = call(u.m_go_get_tr, go, {});
+  bool keep_world = false;
+  call(v.m_set_parent, tr, {parent_tr, &keep_world});
+  return go;
+}
+
+void* add_image(void* go, Color c, bool raycast) {
+  void* img = call(v.m_go_add_comp, go, {v.t_Image});
+  if (!img) return nullptr;
+  call(v.m_set_color, img, {&c});
+  if (v.m_set_raycast) call(v.m_set_raycast, img, {&raycast});
+  return img;
+}
+
+// ---- state
+
 struct State {
-  void* btn = nullptr;      // cloned "Mods" button (Button component)
-  void* win_go = nullptr;   // cloned window GameObject
-  void* win = nullptr;      // its UIWindow component
-  void* win_tr = nullptr;   // its Transform
-  uint32_t h[4] = {0, 0, 0, 0};
-} g;
-
-void release_state() {
-  for (uint32_t& h : g.h) if (h) { g_il.gchandle_free(h); h = 0; }
-  g.btn = g.win_go = g.win = g.win_tr = nullptr;
-}
-
-void pin(void* obj, int slot) { g.h[slot] = g_il.gchandle_new(obj, 0); }
-
-void log_texts(const char* what, const std::vector<void*>& texts) {
-  int i = 0;
-  for (void* t : texts) {
-    std::string s = utf8_from_il2cpp(call(u.m_tmp_get_text, t, {}));
-    if (s.size() > 40) s.resize(40);
-    bearite::log(BEARITE_LOG_DEBUG, TAG, "%s text[%d] = \"%s\"", what, i++, s.c_str());
-  }
-}
-
-bool in_button(void* comp) {
-  return u.m_comp_get_in_parent && u.t_Button && call(u.m_comp_get_in_parent, comp, {u.t_Button}) != nullptr;
-}
-
-// Fills the cloned About window: shortest non-button text becomes the title,
-// the longest one the body, the rest are cleared. Buttons keep their labels.
-void fill_window() {
-  std::vector<void*> texts = components(g.win_go, u.t_TMP_Text);
-  std::vector<void*> plain;
-  for (void* t : texts) if (!in_button(t)) plain.push_back(t);
-  if (plain.empty()) { bearite::log(BEARITE_LOG_WARN, TAG, "window clone has no plain text"); return; }
-
-  auto len = [](void* t) { return utf8_from_il2cpp(call(u.m_tmp_get_text, t, {})).size(); };
-  void* body = plain[0];
-  for (void* t : plain) if (len(t) > len(body)) body = t;
-  void* title = nullptr;
-  for (void* t : plain) if (t != body) { title = t; break; }
-
-  for (void* t : plain) if (t != body && t != title) set_text(t, "");
-  if (title) { set_text(title, "Моды"); set_text(body, mod_list_text()); }
-  else set_text(body, "Моды\n\n" + mod_list_text());
-}
-
-void open_window() {
-  if (!g.win || !u.ok) return;
-  fill_window();
-  bool on = true;
-  call(u.m_win_show, g.win, {&on});
-}
-
-void close_window() {
-  if (!g.win) return;
-  bool off = false;
-  call(u.m_win_show, g.win, {&off});
-}
-
-bool inside_window(void* button) {
-  if (!g.win_tr || !button) return false;
-  void* tr = transform(button);
-  return tr && unbox_bool(call(u.m_is_child_of, tr, {g.win_tr}));
-}
-
-// ----------------------------------------------------------- building ------
-
-void build(void* pause_menu) {
-  if (!init_unity()) return;
-  release_state();
-
-  char* base = static_cast<char*>(pause_menu);
-  void* ach = *reinterpret_cast<void**>(base + OFF_ACHIEVEMENTS_BUTTON);
-  void* about = *reinterpret_cast<void**>(base + OFF_ABOUT_WINDOW);
-  if (!ach || !about) { bearite::log(BEARITE_LOG_WARN, TAG, "achievementsButton/aboutWindow are null, skipping"); return; }
-
-  // ---- button
-  void* ach_tr = transform(ach);
-  void* parent = call(u.m_get_parent, ach_tr, {});
-  void* btn_go = clone_next_to(game_object(ach), parent);
-  if (!btn_go) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloning the button failed"); return; }
-  call(u.m_set_name, btn_go, {il_str("ModsButton")});
-  strip_translate(btn_go);
-
-  std::vector<void*> btn_texts = components(btn_go, u.t_TMP_Text);
-  log_texts("button", btn_texts);
-  if (!btn_texts.empty()) set_text(btn_texts[0], "Моды");
-  for (size_t i = 1; i < btn_texts.size(); ++i) set_text(btn_texts[i], "");
-  void* btn_tr = call(u.m_go_get_tr, btn_go, {});
-  void* btn_comp = call(u.m_go_get_comp, btn_go, {u.t_Button});
-  if (!btn_comp || !btn_tr) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloned button has no Button component"); return; }
-
-  // Put it right after the original in the same column.
-  int idx = unbox_int(call(u.m_get_sibling, ach_tr, {}));
-  int next = idx + 1;
-  call(u.m_set_sibling, btn_tr, {&next});
-  set_active(btn_go, true);
-
-  // If the parent has no layout group, the clone sits exactly on top of the
-  // original: shift it down by one button height.
-  void* layout = (u.m_comp_get_comp && u.t_LayoutGroup) ? call(u.m_comp_get_comp, parent, {u.t_LayoutGroup}) : nullptr;
-  if (!layout && u.m_get_rect && u.m_get_apos && u.m_set_apos) {
-    void* rect = call(u.m_get_rect, btn_tr, {});
-    void* pos = call(u.m_get_apos, btn_tr, {});
-    if (rect && pos) {
-      float* r = static_cast<float*>(g_il.object_unbox(rect));  // x, y, width, height
-      float p[2];
-      memcpy(p, g_il.object_unbox(pos), sizeof(p));
-      p[1] -= r[3] * 1.15f;
-      call(u.m_set_apos, btn_tr, {p});
-    }
-  }
-
-  // ---- window
-  void* about_tr = transform(about);
-  void* about_parent = call(u.m_get_parent, about_tr, {});
-  void* win_go = clone_next_to(game_object(about), about_parent);
-  if (!win_go) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloning the window failed"); return; }
-  call(u.m_set_name, win_go, {il_str("ModsWindow")});
-  strip_translate(win_go);
-  void* win = call(u.m_go_get_comp, win_go, {u.t_UIWindow});
-  void* win_tr = call(u.m_go_get_tr, win_go, {});
-  if (!win || !win_tr) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloned window has no UIWindow"); return; }
-  log_texts("window", components(win_go, u.t_TMP_Text));
-  set_active(win_go, false);
-
-  g.btn = btn_comp;
-  g.win_go = win_go;
-  g.win = win;
-  g.win_tr = win_tr;
-  pin(btn_comp, 0);
-  pin(win_go, 1);
-  pin(win, 2);
-  pin(win_tr, 3);
-  bearite::log(BEARITE_LOG_INFO, TAG, "Mods button and window created");
-}
-
-// -------------------------------------------------------------- hooks ------
-
-void (*orig_start)(void*, void*) = nullptr;
-void (*orig_click)(void*, void*, void*) = nullptr;
-void (*orig_submit)(void*, void*, void*) = nullptr;
-
-void hk_start(void* self, void* mi) {
-  orig_start(self, mi);
-  build(self);
-}
-
-// Returns true if the event was consumed by us.
-bool handle_press(void* button) {
-  if (!g.btn) return false;
-  if (button == g.btn) { open_window(); return true; }
-  if (inside_window(button)) { close_window(); return true; }
-  return false;
-}
-
-void hk_click(void* self, void* ev, void* mi) {
-  if (handle_press(self)) return;
-  orig_click(self, ev, mi);
-}
-
-void hk_submit(void* self, void* ev, void* mi) {
-  if (handle_press(self)) return;
-  orig_submit(self, ev, mi);
-}
-
-}  // namespace
-
-// ------------------------------------------------------- mod entry points --
-
-extern "C" {
-
-BEARITE_EXPORT int bearite_on_load(const BeariteApi* api) {
-  bearite::init(api);
-  bool a = bearite::hook(ASM_GAME, "", "PauseMenuManager", "Start", 0,
-                         reinterpret_cast<void*>(&hk_start), reinterpret_cast<void**>(&orig_start));
-  bool b = bearite::hook(ASM_UI, "UnityEngine.UI", "Button", "OnPointerClick", 1,
-                         reinterpret_cast<void*>(&hk_click), reinterpret_cast<void**>(&orig_click));
-  bool c = bearite::hook(ASM_UI, "UnityEngine.UI", "Button", "OnSubmit", 1,
-                         reinterpret_cast<void*>(&hk_submit), reinterpret_cast<void**>(&orig_submit));
-  bearite::log(BEARITE_LOG_INFO, TAG, "loaded, hooks: Start=%d OnPointerClick=%d OnSubmit=%d", a, b, c);
-  return (a && b && c) ? 0 : 1;
-}
-
-BEARITE_EXPORT void bearite_on_unload(void) { g.btn = nullptr; }
-
-}  // extern "C"
+ 
