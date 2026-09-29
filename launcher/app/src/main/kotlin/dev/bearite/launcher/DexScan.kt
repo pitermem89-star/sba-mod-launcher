@@ -6,33 +6,13 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.zip.ZipFile
 
-object PairipScan {
-
-    fun run(ctx: Context): String {
-        val info = ctx.packageManager.getPackageInfo(Patcher.GAME, 0)
-        val app = info.applicationInfo ?: return "No app info."
-        val sb = StringBuilder()
-        val apks = ArrayList<File>()
-        apks.add(File(app.sourceDir))
-        app.splitSourceDirs?.forEach { apks.add(File(it)) }
-        for (apk in apks) {
-            val zip = ZipFile(apk)
-            try {
-                val entries = zip.entries()
-                while (entries.hasMoreElements()) {
-                    val e = entries.nextElement()
-                    if (!e.name.startsWith("classes") || !e.name.endsWith(".dex")) continue
-                    val bytes = zip.getInputStream(e).use { it.readBytes() }
-                    sb.append("== ").append(apk.name).append(" / ").append(e.name).append('\n')
-                    DexReader(bytes).dumpClasses("Lcom/pairip/", sb)
-                }
-            } finally {
-                zip.close()
-            }
-        }
-        return sb.toString()
-    }
-}
+class MethodInfo(
+    val cls: String,
+    val name: String,
+    val shorty: String,
+    val codeOff: Int,
+    val insnsSize: Int
+)
 
 class DexReader(private val data: ByteArray) {
 
@@ -44,7 +24,7 @@ class DexReader(private val data: ByteArray) {
     private val classDefsSize = buf.getInt(96)
     private val classDefsOff = buf.getInt(100)
 
-    fun string(idx: Int): String {
+    private fun string(idx: Int): String {
         var p = buf.getInt(stringIdsOff + idx * 4)
         while ((data[p].toInt() and 0x80) != 0) p++
         p++
@@ -53,7 +33,7 @@ class DexReader(private val data: ByteArray) {
         return String(data, start, p - start, Charsets.UTF_8)
     }
 
-    fun typeName(idx: Int): String {
+    private fun typeName(idx: Int): String {
         return string(buf.getInt(typeIdsOff + idx * 4))
     }
 
@@ -70,14 +50,22 @@ class DexReader(private val data: ByteArray) {
         return result
     }
 
-    fun dumpClasses(prefix: String, sb: StringBuilder) {
+    private fun methodInfo(cls: String, idx: Int, codeOff: Int): MethodInfo {
+        val m = methodIdsOff + idx * 8
+        val protoIdx = buf.getShort(m + 2).toInt() and 0xffff
+        val nameIdx = buf.getInt(m + 4)
+        val p = protoIdsOff + protoIdx * 12
+        val shorty = string(buf.getInt(p))
+        val size = if (codeOff != 0) buf.getInt(codeOff + 12) else 0
+        return MethodInfo(cls, string(nameIdx), shorty, codeOff, size)
+    }
+
+    fun methods(className: String): List<MethodInfo> {
+        val result = ArrayList<MethodInfo>()
         for (i in 0 until classDefsSize) {
             val def = classDefsOff + i * 32
             val cname = typeName(buf.getInt(def))
-            if (!cname.startsWith(prefix)) continue
-            val superIdx = buf.getInt(def + 8)
-            val superName = if (superIdx < 0) "-" else typeName(superIdx)
-            sb.append(cname).append(" : ").append(superName).append('\n')
+            if (cname != className) continue
             val dataOff = buf.getInt(def + 24)
             if (dataOff == 0) continue
             val pos = intArrayOf(dataOff)
@@ -94,25 +82,40 @@ class DexReader(private val data: ByteArray) {
                 val count = if (list == 0) directMethods else virtualMethods
                 for (k in 0 until count) {
                     methodIdx += uleb(pos)
-                    val flags = uleb(pos)
+                    uleb(pos)
                     val codeOff = uleb(pos)
-                    sb.append(if (list == 0) "  D " else "  V ")
-                    describeMethod(methodIdx, flags, codeOff, sb)
+                    result.add(methodInfo(cname, methodIdx, codeOff))
                 }
             }
         }
+        return result
     }
+}
 
-    private fun describeMethod(idx: Int, flags: Int, codeOff: Int, sb: StringBuilder) {
-        val m = methodIdsOff + idx * 8
-        val protoIdx = buf.getShort(m + 2).toInt() and 0xffff
-        val nameIdx = buf.getInt(m + 4)
-        val p = protoIdsOff + protoIdx * 12
-        val shorty = string(buf.getInt(p))
-        val ret = typeName(buf.getInt(p + 4))
-        sb.append(string(nameIdx)).append(' ').append(shorty).append(' ').append(ret)
-        if ((flags and 0x100) != 0) sb.append(" native")
-        if (codeOff != 0) sb.append(" code=").append(buf.getInt(codeOff + 12))
-        sb.append('\n')
+object PairipScan {
+
+    fun run(ctx: Context): String {
+        val info = ctx.packageManager.getPackageInfo(Patcher.GAME, 0)
+        val app = info.applicationInfo ?: return "No app info."
+        val zip = ZipFile(File(app.sourceDir))
+        try {
+            val entry = zip.getEntry("classes.dex") ?: return "No classes.dex"
+            val bytes = zip.getInputStream(entry).use { it.readBytes() }
+            val sb = StringBuilder()
+            sb.append("classes.dex: ").append(bytes.size / 1024).append(" KB\n")
+            val list = DexReader(bytes).methods(PairipPatch.CLIENT)
+            var n = 0
+            for (m in list) {
+                if (m.name in PairipPatch.TARGETS && m.shorty.startsWith("V") && m.codeOff != 0) {
+                    sb.append("will neutralize: ").append(m.name).append(' ')
+                    sb.append(m.shorty).append(" units=").append(m.insnsSize).append('\n')
+                    n++
+                }
+            }
+            sb.append("Total: ").append(n).append('\n')
+            return sb.toString()
+        } finally {
+            zip.close()
+        }
     }
 }
