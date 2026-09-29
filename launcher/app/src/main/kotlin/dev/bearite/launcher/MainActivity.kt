@@ -53,13 +53,18 @@ class MainActivity : Activity() {
         installButton.text = "Install already prepared files"
         installButton.setOnClickListener { installPrepared() }
 
+        val diagButton = Button(this)
+        diagButton.text = "Diagnose game"
+        diagButton.setOnClickListener { startDiag() }
+
         status = TextView(this)
-        status.textSize = 14f
+        status.textSize = 13f
         status.setTextIsSelectable(true)
         status.text = "WARNING: the original game will be uninstalled, local game data is lost.\n\n"
 
         root.addView(patchButton)
         root.addView(installButton)
+        root.addView(diagButton)
         val scroll = ScrollView(this)
         scroll.addView(status)
         root.addView(scroll)
@@ -76,6 +81,23 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         unregisterReceiver(receiver)
+    }
+
+    private fun startDiag() {
+        if (busy) return
+        busy = true
+        status.text = "Scanning game, please wait...\n"
+        Thread {
+            val result = try {
+                Diag.run(this)
+            } catch (e: Throwable) {
+                "Diag error: $e"
+            }
+            runOnUiThread {
+                busy = false
+                status.text = result
+            }
+        }.start()
     }
 
     private fun startPatch() {
