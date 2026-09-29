@@ -1,81 +1,147 @@
 package dev.bearite.launcher
 
 import android.app.Activity
-import android.content.ContentValues
-import android.content.pm.PackageManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageInstaller
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.MediaStore
+import android.provider.Settings
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
-import java.io.File
-import java.util.zip.ZipFile
 
 class MainActivity : Activity() {
 
-    private val gamePackage = "com.Earthkwak.Platformer"
+    private lateinit var status: TextView
+    private lateinit var patcher: Patcher
+    private var busy = false
+
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            val code = i.getIntExtra(PackageInstaller.EXTRA_STATUS, -1)
+            val msg = i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: ""
+            if (code == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                val confirm = i.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                if (confirm != null) startActivity(confirm)
+            } else if (code == PackageInstaller.STATUS_SUCCESS) {
+                status.append("DONE: patched game installed.\n")
+                patcher.cleanup()
+            } else {
+                status.append("Install failed ($code): $msg\n")
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        patcher = Patcher(this) { m -> runOnUiThread { status.append(m + "\n") } }
+
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setPadding(40, 80, 40, 40)
 
-        val status = TextView(this)
-        status.textSize = 15f
-        status.text = gameInfo()
+        val patchButton = Button(this)
+        patchButton.text = "Patch and install game"
+        patchButton.setOnClickListener { startPatch() }
 
-        val button = Button(this)
-        button.text = "Export libmain.so to Downloads"
-        button.setOnClickListener {
-            status.text = try {
-                exportLibMain()
-            } catch (e: Exception) {
-                "Error: $e"
-            }
-        }
+        val installButton = Button(this)
+        installButton.text = "Install already prepared files"
+        installButton.setOnClickListener { installPrepared() }
 
-        root.addView(button)
-        root.addView(status)
+        status = TextView(this)
+        status.textSize = 14f
+        status.setTextIsSelectable(true)
+        status.text = "WARNING: the original game will be uninstalled, local game data is lost.\n\n"
+
+        root.addView(patchButton)
+        root.addView(installButton)
+        val scroll = ScrollView(this)
+        scroll.addView(status)
+        root.addView(scroll)
         setContentView(root)
-    }
 
-    private fun gameInfo(): String {
-        return try {
-            val info = packageManager.getPackageInfo(gamePackage, 0)
-            "Game found: " + gamePackage + "\nVersion: " + info.versionName
-        } catch (e: PackageManager.NameNotFoundException) {
-            "Game not found: $gamePackage"
+        val filter = IntentFilter(Patcher.ACTION_INSTALL_RESULT)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
         }
     }
 
-    private fun exportLibMain(): String {
-        if (Build.VERSION.SDK_INT < 29) return "Android 10+ required"
-        val info = packageManager.getPackageInfo(gamePackage, 0)
-        val app = info.applicationInfo ?: return "No app info"
-        val dirs = app.splitSourceDirs ?: return "No splits"
-        for (p in dirs) {
-            val zip = ZipFile(File(p))
-            val entry = zip.getEntry("lib/arm64-v8a/libmain.so")
-            if (entry == null) {
-                zip.close()
-                continue
-            }
-            val values = ContentValues()
-            values.put(MediaStore.Downloads.DISPLAY_NAME, "libmain.so")
-            values.put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
-            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            if (uri == null) {
-                zip.close()
-                return "Cannot create file"
-            }
-            contentResolver.openOutputStream(uri)?.use { out ->
-                zip.getInputStream(entry).use { it.copyTo(out) }
-            }
-            zip.close()
-            return "Saved libmain.so to Downloads"
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterReceiver(receiver)
+    }
+
+    private fun startPatch() {
+        if (busy) return
+        if (!patcher.isGameInstalled()) {
+            status.append("Game is not installed.\n")
+            return
         }
-        return "libmain.so not found"
+        if (!packageManager.canRequestPackageInstalls()) {
+            status.append("Allow installing apps for Bearite Launcher, then press the button again.\n")
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
+            )
+            return
+        }
+        busy = true
+        Thread {
+            try {
+                patcher.patch()
+                runOnUiThread {
+                    busy = false
+                    askUninstall()
+                }
+            } catch (e: Throwable) {
+                runOnUiThread {
+                    busy = false
+                    status.append("Patch failed: $e\n")
+                }
+            }
+        }.start()
+    }
+
+    private fun askUninstall() {
+        status.append("Now confirm uninstalling the original game.\n")
+        val intent = Intent(Intent.ACTION_DELETE, Uri.parse("package:" + Patcher.GAME))
+        intent.putExtra(Intent.EXTRA_RETURN_RESULT, true)
+        startActivityForResult(intent, 1)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 1) return
+        if (patcher.isGameInstalled()) {
+            status.append("Uninstall cancelled. Prepared files are kept.\n")
+        } else {
+            installPrepared()
+        }
+    }
+
+    private fun installPrepared() {
+        if (busy) return
+        if (patcher.isGameInstalled()) {
+            status.append("Uninstall the original game first (press Patch and install).\n")
+            return
+        }
+        busy = true
+        Thread {
+            try {
+                patcher.install()
+                runOnUiThread { busy = false }
+            } catch (e: Throwable) {
+                runOnUiThread {
+                    busy = false
+                    status.append("Install error: $e\n")
+                }
+            }
+        }.start()
     }
 }
