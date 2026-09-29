@@ -26,6 +26,7 @@ struct Il2CppApi {
   void* (*class_from_name)(void*, const char*, const char*) = nullptr;
   void* (*class_get_method_from_name)(void*, const char*, int) = nullptr;
   void* (*thread_attach)(void*) = nullptr;
+  void* (*thread_get_all)(size_t*) = nullptr;  // optional
 };
 
 class Runtime {
@@ -98,26 +99,6 @@ class Runtime {
     bool installed = false;  // hook is active
   };
 
-  struct Probe {
-    const Il2CppApi* api;
-    void* domain;
-    void* assembly;
-  };
-  static void do_probe(void* p) {
-    auto* c = static_cast<Probe*>(p);
-    c->domain = c->api->domain_get();
-    if (c->domain) c->assembly = c->api->domain_assembly_open(c->domain, "Assembly-CSharp");
-  }
-
-  struct Attach {
-    const Il2CppApi* api;
-    void* domain;
-  };
-  static void do_attach(void* p) {
-    auto* c = static_cast<Attach*>(p);
-    c->api->thread_attach(c->domain);
-  }
-
   struct ResolveCall {
     const Il2CppApi* api;
     void* domain;
@@ -142,8 +123,13 @@ class Runtime {
                 const std::string& method, int argc) {
     if (assembly.size() > 4 && assembly.compare(assembly.size() - 4, 4, ".dll") == 0)
       assembly.resize(assembly.size() - 4);
+    BLOG_I("runtime", "resolving %s::%s", klass.c_str(), method.c_str());
     ResolveCall call{&api_, domain_, assembly, ns, klass, method, argc, nullptr};
-    if (guarded_call(do_resolve, &call) != 0) return nullptr;
+    int r = guarded_call(do_resolve, &call);
+    if (r != 0) {
+      BLOG_E("runtime", "resolve of %s::%s failed (%d)", klass.c_str(), method.c_str(), r);
+      return nullptr;
+    }
     return call.result;
   }
 
@@ -155,6 +141,7 @@ class Runtime {
              h.ns.c_str(), h.klass.c_str(), h.method.c_str(), h.argc);
       return;
     }
+    BLOG_I("runtime", "installing hook on %s::%s", h.klass.c_str(), h.method.c_str());
     void* dummy = nullptr;
     int rc = DobbyHook(target, h.replacement, h.out_original ? h.out_original : &dummy);
     if (rc != 0) {
@@ -180,18 +167,23 @@ class Runtime {
         dlsym(lib, "il2cpp_class_get_method_from_name"));
     api_.thread_attach =
         reinterpret_cast<decltype(api_.thread_attach)>(dlsym(lib, "il2cpp_thread_attach"));
+    api_.thread_get_all = reinterpret_cast<decltype(api_.thread_get_all)>(
+        dlsym(lib, "il2cpp_thread_get_all_attached_threads"));
     bool ok = api_.domain_get && api_.domain_assembly_open && api_.assembly_get_image &&
               api_.class_from_name && api_.class_get_method_from_name && api_.thread_attach;
     if (!ok) BLOG_E("runtime", "libil2cpp.so does not export the il2cpp_* functions we need");
+    if (!api_.thread_get_all) BLOG_W("runtime", "no thread list API, using a fixed delay");
     return ok;
   }
+
+  static void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
   void watch() {
     // 1. Wait until Unity has loaded libil2cpp.so (up to 2 minutes).
     void* lib = nullptr;
     for (int i = 0; i < 1200 && !lib; ++i) {
       lib = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
-      if (!lib) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (!lib) sleep_ms(100);
     }
     if (!lib) {
       BLOG_E("runtime", "libil2cpp.so never appeared, hooks disabled");
@@ -200,19 +192,49 @@ class Runtime {
     BLOG_I("runtime", "libil2cpp.so found, waiting for the runtime");
     if (!bind(lib)) return;
 
-    // 2. Wait until the runtime has a domain and game code is loaded (up to 2 minutes).
-    for (int i = 0; i < 600 && !domain_; ++i) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      Probe probe{&api_, nullptr, nullptr};
-      if (guarded_call(do_probe, &probe) == 0 && probe.domain && probe.assembly)
-        domain_ = probe.domain;
+    // 2. Wait until the game's main thread is attached to IL2CPP, which means Unity has
+    //    finished starting the scripting runtime. No unsafe jumps here.
+    BLOG_I("runtime", "step 1/4: waiting for the scripting runtime to start");
+    bool started = false;
+    for (int i = 0; i < 600 && !started; ++i) {
+      sleep_ms(200);
+      if (i < 25) continue;  // never look before 5 seconds have passed
+      if (api_.thread_get_all) {
+        size_t n = 0;
+        api_.thread_get_all(&n);
+        started = n > 0;
+      } else {
+        started = i >= 75;  // no API: wait 15 seconds
+      }
     }
-    if (!domain_) {
-      BLOG_E("runtime", "IL2CPP runtime did not become ready, hooks disabled");
+    if (!started) {
+      BLOG_E("runtime", "scripting runtime did not start, hooks disabled");
       return;
     }
-    Attach attach{&api_, domain_};
-    guarded_call(do_attach, &attach);
+    BLOG_I("runtime", "step 2/4: runtime started, short grace period");
+    sleep_ms(3000);
+
+    domain_ = api_.domain_get();
+    if (!domain_) {
+      BLOG_E("runtime", "no IL2CPP domain, hooks disabled");
+      return;
+    }
+
+    // 3. Attach this thread to IL2CPP before using any other API function.
+    BLOG_I("runtime", "step 3/4: attaching thread");
+    api_.thread_attach(domain_);
+
+    // 4. Wait until the game code is available.
+    BLOG_I("runtime", "step 4/4: opening Assembly-CSharp");
+    void* assembly = nullptr;
+    for (int i = 0; i < 60 && !assembly; ++i) {
+      assembly = api_.domain_assembly_open(domain_, "Assembly-CSharp");
+      if (!assembly) sleep_ms(1000);
+    }
+    if (!assembly) {
+      BLOG_E("runtime", "Assembly-CSharp not found, hooks disabled");
+      return;
+    }
     BLOG_I("runtime", "IL2CPP runtime is ready");
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -247,6 +269,7 @@ class Runtime {
       BLOG_W("runtime", "on_update disabled: EventSystem.Update not found");
       return;
     }
+    BLOG_I("runtime", "installing tick hook");
     int rc = DobbyHook(target, reinterpret_cast<void*>(&Runtime::tick_hook),
                        reinterpret_cast<void**>(&tick_original_));
     if (rc != 0) {
