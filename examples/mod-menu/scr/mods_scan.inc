@@ -28,6 +28,21 @@ std::string json_str(const std::string& j, const char* key) {
   return v;
 }
 
+// True if mod.json has "settings": [ ... ] with at least one element.
+bool json_has_settings(const std::string& j) {
+  const std::string k = "\"settings\"";
+  size_t p = j.find(k);
+  if (p == std::string::npos) return false;
+  p = j.find(':', p + k.size());
+  if (p == std::string::npos) return false;
+  ++p;
+  while (p < j.size() && isspace(static_cast<unsigned char>(j[p]))) ++p;
+  if (p >= j.size() || j[p] != '[') return false;
+  ++p;
+  while (p < j.size() && isspace(static_cast<unsigned char>(j[p]))) ++p;
+  return p < j.size() && j[p] != ']';
+}
+
 std::string mods_dir() {
   const BeariteApi* a = bearite::api();
   std::string d = (a && a->mod_dir) ? a->mod_dir : "";
@@ -54,7 +69,7 @@ std::vector<ModInfo> scan_mods() {
       ModInfo m;
       m.dir = dir;
       m.json = json;
-      m.has_settings = json.find("\"settings\"") != std::string::npos;
+      m.has_settings = json_has_settings(json);
       m.name = json_str(json, "name");
       if (m.name.empty()) m.name = json_str(json, "id");
       if (m.name.empty()) m.name = e->d_name;
