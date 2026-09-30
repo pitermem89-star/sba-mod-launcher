@@ -1108,8 +1108,22 @@ void build_cell(void* list_tr, const ModInfo& m, int index, float top, float bot
   call(v.m_size, icon_tr, {&sz});
   if (u.m_set_apos) call(u.m_set_apos, icon_tr, {&pos});
   void* sprite = load_icon(m.dir);
-  void* img = add_image(icon, sprite ? Color{1, 1, 1, 1} : tile_color(m.name), false, sprite == nullptr);
-  if (sprite && img && v.m_set_sprite) call(v.m_set_sprite, img, {sprite});
+  if (sprite && v.Mask && v.t_Mask && v.m_mask_show) {
+    // rounded corners for a real picture: rounded white shape used as a mask
+    add_image(icon, {1, 1, 1, 1}, false, true);
+    void* mk = call(v.m_go_add_comp, icon, {v.t_Mask});
+    bool no = false;
+    if (mk) call(v.m_mask_show, mk, {&no});
+    void* pic = new_ui("Picture", icon_tr);
+    if (pic) {
+      rect(call(u.m_go_get_tr, pic, {}), {0, 0}, {1, 1});
+      void* pimg = add_image(pic, {1, 1, 1, 1}, false, false);
+      if (pimg && v.m_set_sprite) call(v.m_set_sprite, pimg, {sprite});
+    }
+  } else {
+    void* img = add_image(icon, sprite ? Color{1, 1, 1, 1} : tile_color(m.name), false, sprite == nullptr);
+    if (sprite && img && v.m_set_sprite) call(v.m_set_sprite, img, {sprite});
+  }
   if (!sprite) {
     new_label(icon_tr, first_letter(m.name), 514, 46);
     std::vector<void*> ic = components(icon, u.t_TMP_Text);
