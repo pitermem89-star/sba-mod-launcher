@@ -15,7 +15,7 @@
 // Types: bool, int, float, choice (cycles through "choices"). Values are saved
 // to <mod dir>/settings.json, the same file bearite::setting() reads.
 // A key that already exists keeps its JSON type (string / number / bool);
-// a new key is written as a string.
+// a new key is written with the type declared in mod.json.
 
 // ------------------------------------------------------------ tiny JSON ----
 
@@ -274,7 +274,9 @@ std::string current_value(const J& settings, const SettingDef& d) {
   return v->text();
 }
 
-void store_value(J& settings, const std::string& key, const std::string& val) {
+// `type` is the type declared in mod.json; it is used only when the key is new,
+// so that bool / number settings are written as real JSON bool / number.
+void store_value(J& settings, const std::string& key, const std::string& val, const std::string& type = "") {
   if (J* old = settings.get_mut(key.c_str())) {
     if (old->t == J::Bool) { old->b = (val == "true" || val == "1"); return; }
     if (old->t == J::Num) { old->s = val; old->n = strtod(val.c_str(), nullptr); return; }
@@ -283,8 +285,17 @@ void store_value(J& settings, const std::string& key, const std::string& val) {
     return;
   }
   J n;
-  n.t = J::Str;
-  n.s = val;
+  if (type == "bool") {
+    n.t = J::Bool;
+    n.b = (val == "true" || val == "1");
+  } else if (type == "int" || type == "float") {
+    n.t = J::Num;
+    n.s = val;
+    n.n = strtod(val.c_str(), nullptr);
+  } else {
+    n.t = J::Str;
+    n.s = val;
+  }
   settings.o.emplace_back(key, std::move(n));
 }
 
@@ -326,7 +337,7 @@ bool change_setting(const Action& a) {
   } else {
     return false;
   }
-  store_value(settings, d.key, next);
+  store_value(settings, d.key, next, d.type);
   bool ok = write_settings(m.dir, settings);
   bearite::log(ok ? BEARITE_LOG_INFO : BEARITE_LOG_ERROR, TAG, "%s: %s = %s (%s)", m.name.c_str(), d.key.c_str(),
                next.c_str(), ok ? "saved" : "write failed");
@@ -347,7 +358,7 @@ void build_setting_row(void* cell_tr, const SettingDef& d, const std::string& va
   if (!row) return;
   void* row_tr = call(u.m_go_get_tr, row, {});
   rect(row_tr, {0.03f, y0}, {0.97f, y1});
-  add_image(row, COL_SETTING_ROW, false);
+  add_image(row, COL_SETTING_ROW, true);  // rounded
 
   void* label = new_label(row_tr, d.label, 513, 30);
   if (label) rect(call(u.m_go_get_tr, label, {}), {0, 0}, {0.55f, 1}, {22, 2}, {0, -2});
