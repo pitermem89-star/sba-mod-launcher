@@ -447,6 +447,10 @@ bool init_ui() {
   v.t_RectTransform = type_obj(u.RectTransform);
   v.t_Image = type_obj(v.Image);
   v.t_Button = u.t_Button;
+  v.Mask = find_class(ASM_UI, "UnityEngine.UI", "Mask");
+  v.t_Mask = type_obj(v.Mask);
+  v.m_mask_show = find_method_n(v.Mask, "set_showMaskGraphic", 1);
+  v.m_obj_name = find_method_n(u.Object, "get_name", 0);
 
   void* required[] = {v.SystemType, v.m_go_ctor, v.m_go_add_comp, v.m_set_parent, v.m_destroy, v.m_amin, v.m_amax,
                       v.m_omin, v.m_omax, v.m_set_color, v.m_tmp_align, v.t_RectTransform, v.t_Image, v.t_Button};
