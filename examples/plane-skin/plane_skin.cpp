@@ -1,14 +1,17 @@
 // plane_skin.cpp — заменяет модель бумажного самолёта (PaperPlane) на model.glb
 // Всё в одном файле: мини-JSON, загрузчик .glb, доступ к il2cpp и сама замена.
 //
-// Экспортируемые функции (см. раздел 6 внизу):
-//   sba_plane_init(mod_dir)  — один раз при загрузке мода
-//   sba_plane_scan()         — найти все самолёты на сцене и заменить модель
-//   sba_plane_apply(plane)   — заменить модель у одного PaperPlane
+// Экспорты для загрузчика Bearite (см. раздел 6 внизу):
+//   bearite_on_load(api)   — вызывается загрузчиком один раз
+//   bearite_on_update(dt)  — каждый кадр (с главного потока Unity)
+//   bearite_on_unload()    — мод выключен, вернуть оригинальную модель
+// Старые экспорты (для ручного вызова):
+//   sba_plane_init(mod_dir), sba_plane_scan(), sba_plane_apply(plane)
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -18,12 +21,26 @@
 #include <string>
 #include <vector>
 
+#include "../../api/bearite.hpp"
+
 #ifdef __ANDROID__
 #include <android/log.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "SbaPlane", __VA_ARGS__)
 #else
 #define LOGI(...) (fprintf(stderr, __VA_ARGS__), fputc('\n', stderr))
 #endif
+
+// Log into bearite.log through the loader API.
+__attribute__((format(printf, 2, 3)))
+static void say(int level, const char* fmt, ...) {
+  char buf[512];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  if (bearite::api()) bearite::log(level, "plane-skin", "%s", buf);
+  else LOGI("%s", buf);
+}
 
 // ============================================================ 1. mini JSON ==
 
@@ -459,8 +476,11 @@ struct Api {
   void** (*domain_get_assemblies)(void*, size_t*);
   void* (*assembly_get_image)(void*);
   const char* (*image_get_name)(void*);
+  size_t (*image_get_class_count)(void*);
+  void* (*image_get_class)(void*, size_t);
   void* (*class_from_name)(void*, const char*, const char*);
   void* (*class_get_methods)(void*, void**);
+  void* (*class_get_parent)(void*);
   const char* (*method_get_name)(void*);
   uint32_t (*method_get_param_count)(void*);
   void* (*method_get_param)(void*, uint32_t);
@@ -476,425 +496,4 @@ struct Api {
   void* (*class_get_type)(void*);
   void* (*type_get_object)(void*);
   void* (*object_unbox)(void*);
-  uint32_t (*gchandle_new)(void*, int);
-  void (*free_mem)(void*);
-  const uint16_t* (*string_chars)(void*);
-  int32_t (*string_length)(void*);
-  bool ok = false;
-};
-static Api A;
-
-template <class T> static T sym(const char* name) { return reinterpret_cast<T>(dlsym(RTLD_DEFAULT, name)); }
-
-static bool init() {
-  if (A.ok) return true;
-  A.domain_get = sym<decltype(A.domain_get)>("il2cpp_domain_get");
-  A.domain_get_assemblies = sym<decltype(A.domain_get_assemblies)>("il2cpp_domain_get_assemblies");
-  A.assembly_get_image = sym<decltype(A.assembly_get_image)>("il2cpp_assembly_get_image");
-  A.image_get_name = sym<decltype(A.image_get_name)>("il2cpp_image_get_name");
-  A.class_from_name = sym<decltype(A.class_from_name)>("il2cpp_class_from_name");
-  A.class_get_methods = sym<decltype(A.class_get_methods)>("il2cpp_class_get_methods");
-  A.method_get_name = sym<decltype(A.method_get_name)>("il2cpp_method_get_name");
-  A.method_get_param_count = sym<decltype(A.method_get_param_count)>("il2cpp_method_get_param_count");
-  A.method_get_param = sym<decltype(A.method_get_param)>("il2cpp_method_get_param");
-  A.type_get_name = sym<decltype(A.type_get_name)>("il2cpp_type_get_name");
-  A.runtime_invoke = sym<decltype(A.runtime_invoke)>("il2cpp_runtime_invoke");
-  A.string_new = sym<decltype(A.string_new)>("il2cpp_string_new");
-  A.object_new = sym<decltype(A.object_new)>("il2cpp_object_new");
-  A.object_get_class = sym<decltype(A.object_get_class)>("il2cpp_object_get_class");
-  A.class_get_name = sym<decltype(A.class_get_name)>("il2cpp_class_get_name");
-  A.array_new = sym<decltype(A.array_new)>("il2cpp_array_new");
-  A.class_get_field_from_name = sym<decltype(A.class_get_field_from_name)>("il2cpp_class_get_field_from_name");
-  A.field_get_offset = sym<decltype(A.field_get_offset)>("il2cpp_field_get_offset");
-  A.class_get_type = sym<decltype(A.class_get_type)>("il2cpp_class_get_type");
-  A.type_get_object = sym<decltype(A.type_get_object)>("il2cpp_type_get_object");
-  A.object_unbox = sym<decltype(A.object_unbox)>("il2cpp_object_unbox");
-  A.gchandle_new = sym<decltype(A.gchandle_new)>("il2cpp_gchandle_new");
-  A.free_mem = sym<decltype(A.free_mem)>("il2cpp_free");
-  A.string_chars = sym<decltype(A.string_chars)>("il2cpp_string_chars");
-  A.string_length = sym<decltype(A.string_length)>("il2cpp_string_length");
-  A.ok = A.domain_get && A.domain_get_assemblies && A.assembly_get_image && A.image_get_name && A.class_from_name &&
-         A.class_get_methods && A.method_get_name && A.method_get_param_count && A.method_get_param && A.type_get_name &&
-         A.runtime_invoke && A.string_new && A.object_new && A.object_get_class && A.class_get_name && A.array_new &&
-         A.class_get_field_from_name && A.field_get_offset && A.class_get_type && A.type_get_object && A.object_unbox &&
-         A.gchandle_new && A.string_chars && A.string_length;
-  if (!A.ok) LOGI("il2cpp exports not found");
-  return A.ok;
-}
-
-// Имя сборки сравниваем без ".dll".
-static void* klass(const char* image_name, const char* ns, const char* name) {
-  size_t n = 0;
-  void** asms = A.domain_get_assemblies(A.domain_get(), &n);
-  for (size_t i = 0; i < n; ++i) {
-    void* img = A.assembly_get_image(asms[i]);
-    std::string nm = A.image_get_name(img);
-    if (nm.size() > 4 && nm.compare(nm.size() - 4, 4, ".dll") == 0) nm.resize(nm.size() - 4);
-    if (nm == image_name) return A.class_from_name(img, ns, name);
-  }
-  return nullptr;
-}
-
-// Метод по имени и полным именам типов параметров (без путаницы с перегрузками).
-static void* method(void* k, const char* name, std::initializer_list<const char*> params) {
-  if (!k) return nullptr;
-  void* iter = nullptr;
-  while (void* m = A.class_get_methods(k, &iter)) {
-    if (strcmp(A.method_get_name(m), name) != 0) continue;
-    if (A.method_get_param_count(m) != params.size()) continue;
-    bool same = true;
-    uint32_t i = 0;
-    for (const char* want : params) {
-      char* got = A.type_get_name(A.method_get_param(m, i++));
-      if (!got || strcmp(got, want) != 0) same = false;
-      if (got && A.free_mem) A.free_mem(got);
-      if (!same) break;
-    }
-    if (same) return m;
-  }
-  return nullptr;
-}
-
-static void* invoke(void* m, void* self, std::initializer_list<void*> args) {
-  if (!m) return nullptr;
-  void* p[8] = {nullptr};
-  size_t i = 0;
-  for (void* a : args) p[i++] = a;
-  void* exc = nullptr;
-  void* r = A.runtime_invoke(m, self, p, &exc);
-  if (exc) { LOGI("managed exception in %s", A.method_get_name(m)); return nullptr; }
-  return r;
-}
-
-static void* str(const char* s) { return A.string_new(s); }
-static void* type_obj(void* k) { return A.type_get_object(A.class_get_type(k)); }
-static void* new_obj(void* k) { return A.object_new(k); }
-static void pin(void* o) { if (o) A.gchandle_new(o, 0); }
-
-static void* array_data(void* arr) { return static_cast<char*>(arr) + 32; }  // 64-bit
-static size_t array_len(void* arr) { return arr ? *reinterpret_cast<uintptr_t*>(static_cast<char*>(arr) + 24) : 0; }
-
-static void* field_ptr(void* obj, void* k, const char* name) {
-  void* f = A.class_get_field_from_name(k, name);
-  if (!f) return nullptr;
-  return *reinterpret_cast<void**>(static_cast<char*>(obj) + A.field_get_offset(f));
-}
-
-static bool unbox_bool(void* boxed) { return boxed && *static_cast<bool*>(A.object_unbox(boxed)); }
-
-}  // namespace il
-
-// ============================================================ 4. Unity ======
-
-struct V3 { float x, y, z; };
-struct Quat { float x, y, z, w; };
-
-static Quat quat_euler(float pitch, float yaw, float roll) {  // градусы, порядок Unity: Z, X, Y
-  const float k = 3.14159265f / 360.0f;
-  float sx = std::sin(pitch * k), cx = std::cos(pitch * k);
-  float sy = std::sin(yaw * k), cy = std::cos(yaw * k);
-  float sz = std::sin(roll * k), cz = std::cos(roll * k);
-  auto mulq = [](Quat a, Quat b) {
-    return Quat{a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
-  };
-  return mulq(mulq(Quat{0, sy, 0, cy}, Quat{sx, 0, 0, cx}), Quat{0, 0, sz, cz});
-}
-
-struct Unity {
-  void *Mesh, *Texture2D, *Texture, *Material, *GameObject, *Transform, *Component, *Renderer, *MeshFilter,
-      *MeshRenderer, *UObject, *Vector3, *Vector2, *Byte, *Int32, *ImageConversion, *PaperPlane;
-  void *mesh_ctor, *mesh_indexFormat, *mesh_vertices, *mesh_normals, *mesh_uv, *mesh_triangles, *mesh_bounds, *mesh_recalc_normals;
-  void *tex_ctor, *tex_load, *tex_filter, *tex_wrap;
-  void *mat_copy, *mat_maintex, *mat_color;
-  void *go_ctor, *go_addcomp, *go_transform, *go_get_layer, *go_set_layer;
-  void *comp_go, *comp_children, *obj_name;
-  void *tr_setparent, *tr_pos, *tr_rot, *tr_scale, *tr_find;
-  void *mf_mesh, *rend_material, *rend_get_material, *rend_enabled;
-  void *find_objects;
-  bool ok = false;
-};
-static Unity U;
-
-static bool unity_init() {
-  if (U.ok) return true;
-  if (!il::init()) return false;
-  const char* core = "UnityEngine.CoreModule";
-  U.Mesh = il::klass(core, "UnityEngine", "Mesh");
-  U.Texture2D = il::klass(core, "UnityEngine", "Texture2D");
-  U.Texture = il::klass(core, "UnityEngine", "Texture");
-  U.Material = il::klass(core, "UnityEngine", "Material");
-  U.GameObject = il::klass(core, "UnityEngine", "GameObject");
-  U.Transform = il::klass(core, "UnityEngine", "Transform");
-  U.Component = il::klass(core, "UnityEngine", "Component");
-  U.Renderer = il::klass(core, "UnityEngine", "Renderer");
-  U.MeshFilter = il::klass(core, "UnityEngine", "MeshFilter");
-  U.MeshRenderer = il::klass(core, "UnityEngine", "MeshRenderer");
-  U.UObject = il::klass(core, "UnityEngine", "Object");
-  U.Vector3 = il::klass(core, "UnityEngine", "Vector3");
-  U.Vector2 = il::klass(core, "UnityEngine", "Vector2");
-  U.Byte = il::klass("mscorlib", "System", "Byte");
-  U.Int32 = il::klass("mscorlib", "System", "Int32");
-  U.ImageConversion = il::klass("UnityEngine.ImageConversionModule", "UnityEngine", "ImageConversion");
-  U.PaperPlane = il::klass("Assembly-CSharp", "", "PaperPlane");
-
-  U.mesh_ctor = il::method(U.Mesh, ".ctor", {});
-  U.mesh_indexFormat = il::method(U.Mesh, "set_indexFormat", {"UnityEngine.Rendering.IndexFormat"});
-  U.mesh_vertices = il::method(U.Mesh, "set_vertices", {"UnityEngine.Vector3[]"});
-  U.mesh_normals = il::method(U.Mesh, "set_normals", {"UnityEngine.Vector3[]"});
-  U.mesh_uv = il::method(U.Mesh, "set_uv", {"UnityEngine.Vector2[]"});
-  U.mesh_triangles = il::method(U.Mesh, "set_triangles", {"System.Int32[]"});
-  U.mesh_bounds = il::method(U.Mesh, "RecalculateBounds", {});
-  U.mesh_recalc_normals = il::method(U.Mesh, "RecalculateNormals", {});
-  U.tex_ctor = il::method(U.Texture2D, ".ctor", {"System.Int32", "System.Int32"});
-  U.tex_load = il::method(U.ImageConversion, "LoadImage", {"UnityEngine.Texture2D", "System.Byte[]"});
-  U.tex_filter = il::method(U.Texture, "set_filterMode", {"UnityEngine.FilterMode"});
-  U.tex_wrap = il::method(U.Texture, "set_wrapMode", {"UnityEngine.TextureWrapMode"});
-  U.mat_copy = il::method(U.Material, ".ctor", {"UnityEngine.Material"});
-  U.mat_maintex = il::method(U.Material, "set_mainTexture", {"UnityEngine.Texture"});
-  U.mat_color = il::method(U.Material, "set_color", {"UnityEngine.Color"});
-  U.go_ctor = il::method(U.GameObject, ".ctor", {"System.String"});
-  U.go_addcomp = il::method(U.GameObject, "AddComponent", {"System.Type"});
-  U.go_transform = il::method(U.GameObject, "get_transform", {});
-  U.go_get_layer = il::method(U.GameObject, "get_layer", {});
-  U.go_set_layer = il::method(U.GameObject, "set_layer", {"System.Int32"});
-  U.comp_go = il::method(U.Component, "get_gameObject", {});
-  U.obj_name = il::method(U.UObject, "get_name", {});
-  U.comp_children = il::method(U.Component, "GetComponentsInChildren", {"System.Type", "System.Boolean"});
-  U.tr_setparent = il::method(U.Transform, "SetParent", {"UnityEngine.Transform", "System.Boolean"});
-  U.tr_pos = il::method(U.Transform, "set_localPosition", {"UnityEngine.Vector3"});
-  U.tr_rot = il::method(U.Transform, "set_localRotation", {"UnityEngine.Quaternion"});
-  U.tr_scale = il::method(U.Transform, "set_localScale", {"UnityEngine.Vector3"});
-  U.tr_find = il::method(U.Transform, "Find", {"System.String"});
-  U.mf_mesh = il::method(U.MeshFilter, "set_sharedMesh", {"UnityEngine.Mesh"});
-  U.rend_material = il::method(U.Renderer, "set_sharedMaterial", {"UnityEngine.Material"});
-  U.rend_get_material = il::method(U.Renderer, "get_sharedMaterial", {});
-  U.rend_enabled = il::method(U.Renderer, "set_enabled", {"System.Boolean"});
-  U.find_objects = il::method(U.UObject, "FindObjectsOfType", {"System.Type"});
-
-  struct Need { const char* name; void* p; };
-  Need need[] = {{"Mesh", U.Mesh}, {"GameObject", U.GameObject}, {"Transform", U.Transform}, {"PaperPlane", U.PaperPlane},
-                 {"Vector3", U.Vector3}, {"Int32", U.Int32}, {"mesh ctor", U.mesh_ctor}, {"set_vertices", U.mesh_vertices},
-                 {"set_triangles", U.mesh_triangles}, {"go ctor", U.go_ctor}, {"AddComponent", U.go_addcomp},
-                 {"get_transform", U.go_transform}, {"SetParent", U.tr_setparent}, {"set_sharedMesh", U.mf_mesh},
-                 {"set_sharedMaterial", U.rend_material}, {"Material copy ctor", U.mat_copy}, {"GetComponentsInChildren", U.comp_children}};
-  bool all = true;
-  for (const Need& n : need) if (!n.p) { LOGI("missing in game: %s", n.name); all = false; }
-  U.ok = all;
-  return all;
-}
-
-// ========================================================= 5. замена модели =
-
-static std::string g_dir;
-static GlbModel g_model;
-static void* g_mesh = nullptr;
-static void* g_tex = nullptr;
-static bool g_loaded = false, g_failed = false;
-
-struct Cfg {
-  bool enabled = true;
-  float scale = 1, yaw = 0, pitch = 0, roll = 0, ox = 0, oy = 0, oz = 0;
-};
-
-// Читает <mod_dir>/settings.json (его пишет меню модов). Нет файла — значения по умолчанию.
-static Cfg read_cfg() {
-  Cfg c;
-  J j;
-  std::string text = read_file(g_dir + "/settings.json");
-  if (text.empty() || !parse_json(text, j) || j.t != J::Obj) return c;
-  auto f = [&](const char* k, float& dst) {
-    const J* v = j.get(k);
-    if (v && v->t == J::Num) dst = static_cast<float>(v->n);
-    else if (v && v->t == J::Str) dst = static_cast<float>(strtod(v->s.c_str(), nullptr));
-  };
-  if (const J* e = j.get("enabled")) c.enabled = e->t == J::Bool ? e->b : (e->s == "true" || e->s == "1");
-  f("scale", c.scale); f("yaw", c.yaw); f("pitch", c.pitch); f("roll", c.roll);
-  f("offset_x", c.ox); f("offset_y", c.oy); f("offset_z", c.oz);
-  if (c.scale <= 0.001f) c.scale = 1;
-  return c;
-}
-
-static void* make_mesh(const GlbModel& m) {
-  void* mesh = il::new_obj(U.Mesh);
-  il::invoke(U.mesh_ctor, mesh, {});
-  int fmt32 = 1;  // IndexFormat.UInt32
-  il::invoke(U.mesh_indexFormat, mesh, {&fmt32});
-  size_t n = m.vertex_count();
-  void* va = il::A.array_new(U.Vector3, n);
-  memcpy(il::array_data(va), m.pos.data(), n * 12);
-  il::invoke(U.mesh_vertices, mesh, {va});
-  if (m.nrm.size() == m.pos.size() && U.mesh_normals) {
-    void* na = il::A.array_new(U.Vector3, n);
-    memcpy(il::array_data(na), m.nrm.data(), n * 12);
-    il::invoke(U.mesh_normals, mesh, {na});
-  }
-  if (m.uv.size() == n * 2 && U.mesh_uv && U.Vector2) {
-    void* ua = il::A.array_new(U.Vector2, n);
-    memcpy(il::array_data(ua), m.uv.data(), n * 8);
-    il::invoke(U.mesh_uv, mesh, {ua});
-  }
-  void* ia = il::A.array_new(U.Int32, m.idx.size());
-  memcpy(il::array_data(ia), m.idx.data(), m.idx.size() * 4);
-  il::invoke(U.mesh_triangles, mesh, {ia});
-  if (m.nrm.size() != m.pos.size()) il::invoke(U.mesh_recalc_normals, mesh, {});
-  il::invoke(U.mesh_bounds, mesh, {});
-  il::pin(mesh);
-  return mesh;
-}
-
-static void* make_texture(const std::string& img) {
-  if (!U.Texture2D || !U.tex_ctor || !U.tex_load || !U.Byte || img.empty()) return nullptr;
-  void* tex = il::new_obj(U.Texture2D);
-  int two = 2;
-  il::invoke(U.tex_ctor, tex, {&two, &two});
-  void* bytes = il::A.array_new(U.Byte, img.size());
-  memcpy(il::array_data(bytes), img.data(), img.size());
-  if (!il::unbox_bool(il::invoke(U.tex_load, nullptr, {tex, bytes}))) { LOGI("texture decode failed"); return nullptr; }
-  int point = 0, clamp = 1;  // FilterMode.Point — чёткие пиксели Blockbench
-  il::invoke(U.tex_filter, tex, {&point});
-  il::invoke(U.tex_wrap, tex, {&clamp});
-  il::pin(tex);
-  return tex;
-}
-
-static bool ensure_model() {
-  if (g_loaded) return true;
-  if (g_failed || !unity_init()) return false;
-  g_failed = true;  // если что-то пойдёт не так, второй раз не пробуем
-  std::string file = read_file(g_dir + "/model.glb");
-  if (file.empty()) { LOGI("model.glb not found in %s", g_dir.c_str()); return false; }
-  if (!glb::parse(file, g_model)) { LOGI("model.glb: %s", g_model.error.c_str()); return false; }
-  g_mesh = make_mesh(g_model);
-  g_tex = make_texture(g_model.image);
-  if (!g_mesh) return false;
-  LOGI("model loaded: %zu vertices, %zu triangles, texture: %s", g_model.vertex_count(), g_model.idx.size() / 3, g_tex ? "yes" : "no");
-  g_failed = false;
-  g_loaded = true;
-  return true;
-}
-
-static bool is_mesh_renderer(void* obj) {
-  const char* n = il::A.class_get_name(il::A.object_get_class(obj));
-  return n && strstr(n, "MeshRenderer") != nullptr;
-}
-
-static void place(void* tr, const Cfg& c) {
-  V3 pos{c.ox, c.oy, c.oz}, scl{c.scale, c.scale, c.scale};
-  Quat rot = quat_euler(c.pitch, c.yaw, c.roll);
-  il::invoke(U.tr_pos, tr, {&pos});
-  il::invoke(U.tr_rot, tr, {&rot});
-  il::invoke(U.tr_scale, tr, {&scl});
-}
-
-static const char* OUR_NAME = "SbaCustomPlane";
-
-static bool is_ours(void* go) {
-  if (!go || !U.obj_name) return false;
-  void* s = il::invoke(U.obj_name, go, {});
-  if (!s) return false;
-  const uint16_t* ch = il::A.string_chars(s);
-  int32_t len = il::A.string_length(s);
-  if (len != static_cast<int32_t>(strlen(OUR_NAME))) return false;
-  for (int32_t i = 0; i < len; ++i) if (ch[i] != static_cast<uint16_t>(OUR_NAME[i])) return false;
-  return true;
-}
-
-// Включает/выключает меши: наш объект получает ours_on, родные меши самолёта — обратное.
-static void set_renderers(void* plane_mesh_tr, bool ours_on) {
-  if (!U.Renderer || !U.rend_enabled) return;
-  bool incl = true;
-  void* arr = il::invoke(U.comp_children, plane_mesh_tr, {il::type_obj(U.Renderer), &incl});
-  size_t n = il::array_len(arr);
-  void** items = static_cast<void**>(il::array_data(arr));
-  for (size_t i = 0; i < n; ++i) {
-    if (!items[i] || !is_mesh_renderer(items[i])) continue;
-    bool ours = is_ours(il::invoke(U.comp_go, items[i], {}));
-    bool on = ours ? ours_on : !ours_on;
-    il::invoke(U.rend_enabled, items[i], {&on});
-  }
-}
-
-extern "C" void sba_plane_apply(void* plane) {
-  if (!plane || !ensure_model()) return;
-  Cfg c = read_cfg();
-  void* pm = il::field_ptr(plane, U.PaperPlane, "planeMesh");  // Transform с моделью самолёта
-  if (!pm) { LOGI("planeMesh is null"); return; }
-
-  void* existing = il::invoke(U.tr_find, pm, {il::str(OUR_NAME)});
-  if (existing) {  // уже заменено: обновляем настройки и состояние мешей
-    place(existing, c);
-    set_renderers(pm, c.enabled);
-    return;
-  }
-  if (!c.enabled) return;
-
-  // Материал: копия материала самолёта, чтобы сохранить его шейдер.
-  void* src = il::field_ptr(plane, U.PaperPlane, "planeMaterial");
-  if (!src) {
-    bool incl = true;
-    void* arr = il::invoke(U.comp_children, pm, {il::type_obj(U.Renderer), &incl});
-    void** items = static_cast<void**>(il::array_data(arr));
-    for (size_t i = 0; i < il::array_len(arr) && !src; ++i)
-      if (items[i] && is_mesh_renderer(items[i])) src = il::invoke(U.rend_get_material, items[i], {});
-  }
-  void* mat = nullptr;
-  if (src) {
-    mat = il::new_obj(U.Material);
-    il::invoke(U.mat_copy, mat, {src});
-    if (g_tex && U.mat_maintex) il::invoke(U.mat_maintex, mat, {g_tex});
-    else if (U.mat_color) il::invoke(U.mat_color, mat, {g_model.color});
-  } else {
-    LOGI("no source material found, the model may look wrong");
-  }
-
-  set_renderers(pm, true);  // прячем родные меши (нашего объекта ещё нет)
-
-  void* go = il::new_obj(U.GameObject);
-  il::invoke(U.go_ctor, go, {il::str(OUR_NAME)});
-  void* mf = il::invoke(U.go_addcomp, go, {il::type_obj(U.MeshFilter)});
-  void* mr = il::invoke(U.go_addcomp, go, {il::type_obj(U.MeshRenderer)});
-  il::invoke(U.mf_mesh, mf, {g_mesh});
-  if (mat) il::invoke(U.rend_material, mr, {mat});
-
-  void* tr = il::invoke(U.go_transform, go, {});
-  bool keep_world = false;
-  il::invoke(U.tr_setparent, tr, {pm, &keep_world});
-  place(tr, c);
-  if (U.comp_go && U.go_get_layer && U.go_set_layer) {  // тот же слой, что у самолёта
-    void* pgo = il::invoke(U.comp_go, pm, {});
-    void* layer = il::invoke(U.go_get_layer, pgo, {});
-    if (layer) il::invoke(U.go_set_layer, go, {layer ? il::A.object_unbox(layer) : nullptr});
-  }
-  il::pin(go);
-  LOGI("plane model replaced");
-}
-
-extern "C" int sba_plane_scan() {
-  if (!ensure_model()) return 0;
-  void* arr = il::invoke(U.find_objects, nullptr, {il::type_obj(U.PaperPlane)});
-  size_t n = il::array_len(arr);
-  void** items = static_cast<void**>(il::array_data(arr));
-  for (size_t i = 0; i < n; ++i) sba_plane_apply(items[i]);
-  LOGI("planes found: %zu", n);
-  return static_cast<int>(n);
-}
-
-extern "C" void sba_plane_init(const char* mod_dir) {
-  g_dir = mod_dir ? mod_dir : "";
-  while (g_dir.size() > 1 && g_dir.back() == '/') g_dir.pop_back();
-  g_loaded = g_failed = false;
-  LOGI("plane_skin ready, dir: %s", g_dir.c_str());
-}
-
-// ====================================================== 6. связка с загрузчиком
-// Этот раздел зависит от твоего загрузчика (Bearite). Нужно два вызова:
-//
-//   1) при загрузке мода:            sba_plane_init(mod_dir);
-//   2) когда на сцене появляется самолёт — самый простой способ: в момент
-//      создания меню паузы (где у тебя build(pause_menu)) вызывать
-//                                    sba_plane_scan();
-//      Он найдёт все PaperPlane на сцене и заменит модель.
-//
-// Точнее — повесить хук на PaperPlane.Start (RVA 0x1A89ABC) и после оригинала
-// вызвать sba_plane_apply(this). Как регистрировать хук — в твоём hooks.inc.
+  uint32_t (*gchandle_new)(void*, int
