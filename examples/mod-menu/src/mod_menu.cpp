@@ -1103,7 +1103,7 @@ void build_cell(void* list_tr, const ModInfo& m, int index, float top, float bot
   Vec2 c = {0, 0.5f};
   call(v.m_amin, icon_tr, {&c});
   call(v.m_amax, icon_tr, {&c});
-  Vec2 pv = {0, 0.5f}, sz = {84, 84}, pos = {16, 0};
+  Vec2 pv = {0, 0.5f}, sz = {76, 76}, pos = {20, 0};
   call(v.m_pivot, icon_tr, {&pv});
   call(v.m_size, icon_tr, {&sz});
   if (u.m_set_apos) call(u.m_set_apos, icon_tr, {&pos});
