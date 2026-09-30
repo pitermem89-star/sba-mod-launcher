@@ -27,10 +27,16 @@ jobs:
           echo "STRIP=$BIN/llvm-strip" >> "$GITHUB_ENV"
           echo "NM=$BIN/llvm-nm" >> "$GITHUB_ENV"
 
-      - name: Check sources exist
+      - name: Locate mod sources
         run: |
-          test -f "$MOD_DIR/plane_skin.cpp" || { echo "::error::$MOD_DIR/plane_skin.cpp not found"; exit 1; }
-          test -f "$MOD_DIR/mod.json" || { echo "::error::$MOD_DIR/mod.json not found"; exit 1; }
+          SRC=$(find . -name plane_skin.cpp -not -path "./.git/*" | head -n1)
+          if [ -z "$SRC" ]; then
+            echo "::error::plane_skin.cpp not found anywhere in the repo"
+            find . -maxdepth 3 -not -path "./.git/*" | sort
+            exit 1
+          fi
+          echo "MOD_DIR=$(dirname "$SRC")" >> "$GITHUB_ENV"
+          test -f "$(dirname "$SRC")/mod.json" || { echo "::error::mod.json not next to plane_skin.cpp"; exit 1; }
 
       - name: Compile (arm64-v8a)
         run: |
