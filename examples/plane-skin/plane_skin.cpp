@@ -496,4 +496,541 @@ struct Api {
   void* (*class_get_type)(void*);
   void* (*type_get_object)(void*);
   void* (*object_unbox)(void*);
-  uint32_t (*gchandle_new)(void*, int
+  uint32_t (*gchandle_new)(void*, int);
+  void (*free_mem)(void*);
+  const uint16_t* (*string_chars)(void*);
+  int32_t (*string_length)(void*);
+  bool ok = false;
+};
+static Api A;
+static void* g_lib = nullptr;
+
+// libil2cpp.so is usually loaded with RTLD_LOCAL, so look in its own handle first.
+template <class T> static T sym(const char* name) {
+  void* p = g_lib ? dlsym(g_lib, name) : nullptr;
+  if (!p) p = dlsym(RTLD_DEFAULT, name);
+  return reinterpret_cast<T>(p);
+}
+
+static bool init() {
+  if (A.ok) return true;
+  g_lib = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+#define L(field, name) A.field = sym<decltype(A.field)>(name)
+  L(domain_get, "il2cpp_domain_get");
+  L(domain_get_assemblies, "il2cpp_domain_get_assemblies");
+  L(assembly_get_image, "il2cpp_assembly_get_image");
+  L(image_get_name, "il2cpp_image_get_name");
+  L(image_get_class_count, "il2cpp_image_get_class_count");
+  L(image_get_class, "il2cpp_image_get_class");
+  L(class_from_name, "il2cpp_class_from_name");
+  L(class_get_methods, "il2cpp_class_get_methods");
+  L(class_get_parent, "il2cpp_class_get_parent");
+  L(method_get_name, "il2cpp_method_get_name");
+  L(method_get_param_count, "il2cpp_method_get_param_count");
+  L(method_get_param, "il2cpp_method_get_param");
+  L(type_get_name, "il2cpp_type_get_name");
+  L(runtime_invoke, "il2cpp_runtime_invoke");
+  L(string_new, "il2cpp_string_new");
+  L(object_new, "il2cpp_object_new");
+  L(object_get_class, "il2cpp_object_get_class");
+  L(class_get_name, "il2cpp_class_get_name");
+  L(array_new, "il2cpp_array_new");
+  L(class_get_field_from_name, "il2cpp_class_get_field_from_name");
+  L(field_get_offset, "il2cpp_field_get_offset");
+  L(class_get_type, "il2cpp_class_get_type");
+  L(type_get_object, "il2cpp_type_get_object");
+  L(object_unbox, "il2cpp_object_unbox");
+  L(gchandle_new, "il2cpp_gchandle_new");
+  L(free_mem, "il2cpp_free");
+  L(string_chars, "il2cpp_string_chars");
+  L(string_length, "il2cpp_string_length");
+#undef L
+  A.ok = A.domain_get && A.domain_get_assemblies && A.assembly_get_image && A.image_get_name &&
+         A.class_from_name && A.class_get_methods && A.class_get_parent && A.method_get_name &&
+         A.method_get_param_count && A.method_get_param && A.type_get_name && A.runtime_invoke &&
+         A.object_new && A.array_new && A.class_get_type && A.type_get_object && A.object_unbox &&
+         A.gchandle_new;
+  if (!A.ok) say(BEARITE_LOG_ERROR, "il2cpp API is incomplete (libil2cpp handle: %s)", g_lib ? "yes" : "no");
+  return A.ok;
+}
+
+// "UnityEngine.CoreModule.dll" matches "UnityEngine.CoreModule".
+static bool name_match(const char* have, const char* want) {
+  size_t hl = strlen(have);
+  if (hl > 4 && strcmp(have + hl - 4, ".dll") == 0) hl -= 4;
+  return strlen(want) == hl && strncmp(have, want, hl) == 0;
+}
+
+static void* find_image(const char* asm_name) {
+  size_t cnt = 0;
+  void** list = A.domain_get_assemblies(A.domain_get(), &cnt);
+  if (!list) return nullptr;
+  for (size_t i = 0; i < cnt; ++i) {
+    void* img = A.assembly_get_image(list[i]);
+    const char* nm = img ? A.image_get_name(img) : nullptr;
+    if (nm && name_match(nm, asm_name)) return img;
+  }
+  return nullptr;
+}
+
+static void* find_class(const char* asm_name, const char* ns, const char* name) {
+  void* img = find_image(asm_name);
+  return img ? A.class_from_name(img, ns, name) : nullptr;
+}
+
+// Same, but ignores the namespace (used if the game class is not in the global one).
+static void* find_class_any_ns(const char* asm_name, const char* name) {
+  void* img = find_image(asm_name);
+  if (!img || !A.image_get_class_count || !A.image_get_class || !A.class_get_name) return nullptr;
+  size_t cnt = A.image_get_class_count(img);
+  for (size_t i = 0; i < cnt; ++i) {
+    void* k = A.image_get_class(img, i);
+    if (k && strcmp(A.class_get_name(k), name) == 0) return k;
+  }
+  return nullptr;
+}
+
+// Finds a method by name and argument count, looking through base classes.
+// p0 (optional) is the type name of the first parameter, e.g. "System.Type":
+// it tells apart overloads such as GetComponent(Type) and GetComponent(string).
+static void* find_method(void* klass, const char* name, int argc, const char* p0 = nullptr) {
+  for (void* k = klass; k; k = A.class_get_parent(k)) {
+    void* it = nullptr;
+    while (void* m = A.class_get_methods(k, &it)) {
+      if (strcmp(A.method_get_name(m), name) != 0) continue;
+      if (static_cast<int>(A.method_get_param_count(m)) != argc) continue;
+      if (p0 && argc > 0) {
+        char* tn = A.type_get_name(A.method_get_param(m, 0));
+        bool same = tn && strcmp(tn, p0) == 0;
+        if (tn && A.free_mem) A.free_mem(tn);
+        if (!same) continue;
+      }
+      return m;
+    }
+  }
+  return nullptr;
+}
+
+static bool g_exc = false;  // true if the last call() threw a managed exception
+
+static void* call(void* method, void* obj, std::initializer_list<void*> args = {}) {
+  void* buf[8];
+  size_t n = 0;
+  for (void* p : args) if (n < 8) buf[n++] = p;
+  void* exc = nullptr;
+  void* r = A.runtime_invoke(method, obj, n ? buf : nullptr, &exc);
+  g_exc = exc != nullptr;
+  return g_exc ? nullptr : r;
+}
+
+static int unbox_int(void* boxed) {
+  return boxed ? *static_cast<int*>(A.object_unbox(boxed)) : 0;
+}
+
+// Keeps a managed object alive forever (the GC would collect it otherwise).
+static void* keep(void* obj) {
+  if (obj) A.gchandle_new(obj, 0);
+  return obj;
+}
+
+static void* type_object(void* klass) { return keep(A.type_get_object(A.class_get_type(klass))); }
+
+// Managed array layout: object header (2 pointers), bounds pointer, length, then the data.
+static uint8_t* arr_data(void* arr) { return static_cast<uint8_t*>(arr) + 4 * sizeof(void*); }
+static size_t arr_len(void* arr) { return arr ? *reinterpret_cast<size_t*>(static_cast<uint8_t*>(arr) + 3 * sizeof(void*)) : 0; }
+
+}  // namespace il
+
+// ========================================================= 4. замена модели ==
+
+namespace sk {
+
+using namespace il;
+
+struct Config {
+  bool enabled = true;
+  float scale = 1, yaw = 0, pitch = 0, roll = 0, offset_y = 0;
+  bool operator==(const Config& o) const {
+    return enabled == o.enabled && scale == o.scale && yaw == o.yaw && pitch == o.pitch &&
+           roll == o.roll && offset_y == o.offset_y;
+  }
+};
+
+struct Entry {          // one MeshFilter we touched
+  int plane_id = 0;
+  void* filter = nullptr;
+  void* orig_mesh = nullptr;
+  bool primary = false;  // the filter that gets our mesh; the others are hidden
+  void* mat = nullptr;   // material of the primary filter
+  void* orig_tex = nullptr;
+  float orig_col[4] = {1, 1, 1, 1};
+  bool dead = false;
+};
+
+static std::string g_dir;
+static GlbModel g_model;
+static Config g_cfg, g_applied;
+static bool g_ready = false, g_failed = false, g_have_cfg = false;
+static float g_t_cfg = 0.5f, g_t_scan = 1.0f;
+
+static void *k_plane, *k_obj, *k_mf, *k_mesh, *k_tex, *k_v3, *k_v2, *k_i32, *k_u8;
+static void *t_plane, *t_mf, *t_mr;
+static void *m_find, *m_gcic, *m_gc, *m_instid, *m_get_shared, *m_set_shared, *m_get_mat,
+    *m_get_tex, *m_set_tex, *m_get_col, *m_set_col, *m_set_verts, *m_set_norms, *m_set_uv,
+    *m_set_tris, *m_set_ifmt, *m_recalc_b, *m_recalc_n;
+static bool m_find_by = false;  // FindObjectsByType(Type, sortMode) instead of FindObjectsOfType(Type)
+static void* g_mesh = nullptr;
+static void* g_tex = nullptr;
+static std::vector<Entry> g_entries;
+static std::vector<int> g_seen;
+
+static std::string settings_path() { return g_dir + "/settings.json"; }
+
+// Reads one setting: settings.json in the mod folder first (always fresh),
+// then the loader API.
+static bool get_raw(const J* file, const char* key, double& num_out) {
+  if (file) {
+    if (const J* v = file->get(key)) {
+      if (v->t == J::Num) { num_out = v->n; return true; }
+      if (v->t == J::Bool) { num_out = v->b ? 1 : 0; return true; }
+      if (v->t == J::Str && !v->s.empty()) {
+        if (v->s == "true") { num_out = 1; return true; }
+        if (v->s == "false") { num_out = 0; return true; }
+        num_out = strtod(v->s.c_str(), nullptr);
+        return true;
+      }
+    }
+  }
+  std::string s = bearite::setting(key, "");
+  if (s.empty()) return false;
+  if (s == "true") { num_out = 1; return true; }
+  if (s == "false") { num_out = 0; return true; }
+  num_out = strtod(s.c_str(), nullptr);
+  return true;
+}
+
+static Config read_config() {
+  Config c;
+  J file;
+  std::string text = read_file(settings_path());
+  const J* f = (!text.empty() && parse_json(text, file) && file.t == J::Obj) ? &file : nullptr;
+  double v;
+  if (get_raw(f, "enabled", v)) c.enabled = v != 0;
+  if (get_raw(f, "scale", v)) c.scale = static_cast<float>(v);
+  if (get_raw(f, "yaw", v)) c.yaw = static_cast<float>(v);
+  if (get_raw(f, "pitch", v)) c.pitch = static_cast<float>(v);
+  if (get_raw(f, "roll", v)) c.roll = static_cast<float>(v);
+  if (get_raw(f, "offset_y", v)) c.offset_y = static_cast<float>(v);
+  c.scale = std::min(10.0f, std::max(0.05f, c.scale));
+  return c;
+}
+
+// ---- mesh ----
+
+static void* new_array(void* elem_class, size_t n) { return A.array_new(elem_class, n); }
+
+// Pushes the model into the Unity mesh. full = also indices and UVs (first time only).
+static void upload_mesh(bool full) {
+  size_t n = g_model.vertex_count();
+  const float d2r = 3.14159265f / 180.0f;
+  float cy = std::cos(g_cfg.yaw * d2r), sy = std::sin(g_cfg.yaw * d2r);
+  float cx = std::cos(g_cfg.pitch * d2r), sx = std::sin(g_cfg.pitch * d2r);
+  float cz = std::cos(g_cfg.roll * d2r), sz = std::sin(g_cfg.roll * d2r);
+  // Unity order: roll (Z), then pitch (X), then yaw (Y).  R = Ry * Rx * Rz
+  float ry[9] = {cy, 0, sy, 0, 1, 0, -sy, 0, cy};
+  float rx[9] = {1, 0, 0, 0, cx, -sx, 0, sx, cx};
+  float rz[9] = {cz, -sz, 0, sz, cz, 0, 0, 0, 1};
+  float t[9], r[9];
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) {
+      t[i * 3 + j] = rx[i * 3] * rz[j] + rx[i * 3 + 1] * rz[3 + j] + rx[i * 3 + 2] * rz[6 + j];
+    }
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) {
+      r[i * 3 + j] = ry[i * 3] * t[j] + ry[i * 3 + 1] * t[3 + j] + ry[i * 3 + 2] * t[6 + j];
+    }
+  void* va = new_array(k_v3, n);
+  float* vp = reinterpret_cast<float*>(arr_data(va));
+  for (size_t i = 0; i < n; ++i) {
+    const float* p = &g_model.pos[i * 3];
+    vp[i * 3] = (r[0] * p[0] + r[1] * p[1] + r[2] * p[2]) * g_cfg.scale;
+    vp[i * 3 + 1] = (r[3] * p[0] + r[4] * p[1] + r[5] * p[2]) * g_cfg.scale + g_cfg.offset_y;
+    vp[i * 3 + 2] = (r[6] * p[0] + r[7] * p[1] + r[8] * p[2]) * g_cfg.scale;
+  }
+  if (full && n > 65535 && m_set_ifmt) {
+    int fmt = 1;  // IndexFormat.UInt32
+    call(m_set_ifmt, g_mesh, {&fmt});
+  }
+  call(m_set_verts, g_mesh, {va});
+  if (full) {
+    void* ta = new_array(k_i32, g_model.idx.size());
+    memcpy(arr_data(ta), g_model.idx.data(), g_model.idx.size() * sizeof(uint32_t));
+    call(m_set_tris, g_mesh, {ta});
+    if (!g_model.uv.empty() && m_set_uv) {
+      void* ua = new_array(k_v2, n);
+      memcpy(arr_data(ua), g_model.uv.data(), n * 2 * sizeof(float));
+      call(m_set_uv, g_mesh, {ua});
+    }
+  }
+  if (!g_model.nrm.empty() && m_set_norms) {
+    void* na = new_array(k_v3, n);
+    float* np = reinterpret_cast<float*>(arr_data(na));
+    for (size_t i = 0; i < n; ++i) {
+      const float* p = &g_model.nrm[i * 3];
+      np[i * 3] = r[0] * p[0] + r[1] * p[1] + r[2] * p[2];
+      np[i * 3 + 1] = r[3] * p[0] + r[4] * p[1] + r[5] * p[2];
+      np[i * 3 + 2] = r[6] * p[0] + r[7] * p[1] + r[8] * p[2];
+    }
+    call(m_set_norms, g_mesh, {na});
+  } else if (m_recalc_n) {
+    call(m_recalc_n, g_mesh);
+  }
+  if (m_recalc_b) call(m_recalc_b, g_mesh);
+}
+
+// ---- setup ----
+
+static bool need(void* p, const char* what) {
+  if (!p) { say(BEARITE_LOG_ERROR, "setup failed: %s not found", what); g_failed = true; return false; }
+  return true;
+}
+
+static bool setup() {
+  if (!il::init()) { g_failed = true; return false; }
+  const char* core = "UnityEngine.CoreModule";
+  k_plane = find_class("Assembly-CSharp", "", "PaperPlane");
+  if (!k_plane) k_plane = find_class_any_ns("Assembly-CSharp", "PaperPlane");
+  k_obj = find_class(core, "UnityEngine", "Object");
+  void* k_comp = find_class(core, "UnityEngine", "Component");
+  k_mf = find_class(core, "UnityEngine", "MeshFilter");
+  void* k_mr = find_class(core, "UnityEngine", "MeshRenderer");
+  k_mesh = find_class(core, "UnityEngine", "Mesh");
+  k_tex = find_class(core, "UnityEngine", "Texture2D");
+  void* k_mat = find_class(core, "UnityEngine", "Material");
+  k_v3 = find_class(core, "UnityEngine", "Vector3");
+  k_v2 = find_class(core, "UnityEngine", "Vector2");
+  k_i32 = find_class("mscorlib", "System", "Int32");
+  k_u8 = find_class("mscorlib", "System", "Byte");
+  if (!need(k_plane, "class PaperPlane (Assembly-CSharp)") || !need(k_obj, "UnityEngine.Object") ||
+      !need(k_comp, "UnityEngine.Component") || !need(k_mf, "UnityEngine.MeshFilter") ||
+      !need(k_mr, "UnityEngine.MeshRenderer") || !need(k_mesh, "UnityEngine.Mesh") ||
+      !need(k_mat, "UnityEngine.Material") || !need(k_v3, "Vector3") || !need(k_v2, "Vector2") ||
+      !need(k_i32, "System.Int32") || !need(k_u8, "System.Byte"))
+    return false;
+
+  t_plane = type_object(k_plane);
+  t_mf = type_object(k_mf);
+  t_mr = type_object(k_mr);
+
+  m_find = find_method(k_obj, "FindObjectsOfType", 1, "System.Type");
+  if (!m_find) { m_find = find_method(k_obj, "FindObjectsByType", 2, "System.Type"); m_find_by = m_find != nullptr; }
+  m_gcic = find_method(k_comp, "GetComponentsInChildren", 2, "System.Type");
+  m_gc = find_method(k_comp, "GetComponent", 1, "System.Type");
+  m_instid = find_method(k_obj, "GetInstanceID", 0);
+  m_get_shared = find_method(k_mf, "get_sharedMesh", 0);
+  m_set_shared = find_method(k_mf, "set_sharedMesh", 1);
+  m_get_mat = find_method(k_mr, "get_material", 0);
+  m_get_tex = find_method(k_mat, "get_mainTexture", 0);
+  m_set_tex = find_method(k_mat, "set_mainTexture", 1);
+  m_get_col = find_method(k_mat, "get_color", 0);
+  m_set_col = find_method(k_mat, "set_color", 1);
+  m_set_verts = find_method(k_mesh, "set_vertices", 1);
+  m_set_norms = find_method(k_mesh, "set_normals", 1);
+  m_set_uv = find_method(k_mesh, "set_uv", 1);
+  m_set_tris = find_method(k_mesh, "set_triangles", 1);
+  m_set_ifmt = find_method(k_mesh, "set_indexFormat", 1);
+  m_recalc_b = find_method(k_mesh, "RecalculateBounds", 0);
+  m_recalc_n = find_method(k_mesh, "RecalculateNormals", 0);
+  if (!need(m_find, "Object.FindObjectsOfType") || !need(m_gcic, "Component.GetComponentsInChildren(Type,bool)") ||
+      !need(m_gc, "Component.GetComponent(Type)") || !need(m_instid, "Object.GetInstanceID") ||
+      !need(m_get_shared, "MeshFilter.get_sharedMesh") || !need(m_set_shared, "MeshFilter.set_sharedMesh") ||
+      !need(m_get_mat, "Renderer.get_material") || !need(m_set_verts, "Mesh.set_vertices") ||
+      !need(m_set_tris, "Mesh.set_triangles"))
+    return false;
+
+  // model.glb
+  std::string file = read_file(g_dir + "/model.glb");
+  if (file.empty()) {
+    say(BEARITE_LOG_ERROR, "model.glb not found in %s", g_dir.c_str());
+    g_failed = true;
+    return false;
+  }
+  if (!glb::parse(file, g_model)) {
+    say(BEARITE_LOG_ERROR, "model.glb: %s", g_model.error.c_str());
+    g_failed = true;
+    return false;
+  }
+  say(BEARITE_LOG_INFO, "model.glb loaded: %zu vertices, %zu triangles, texture: %s", g_model.vertex_count(),
+      g_model.idx.size() / 3, g_model.image.empty() ? "no" : "yes");
+
+  // texture
+  if (!g_model.image.empty() && k_tex) {
+    void* ctor = find_method(k_tex, ".ctor", 2, "System.Int32");
+    void* tex = ctor ? A.object_new(k_tex) : nullptr;
+    if (tex) {
+      int w = 2, h = 2;
+      call(ctor, tex, {&w, &h});
+      void* bytes = new_array(k_u8, g_model.image.size());
+      memcpy(arr_data(bytes), g_model.image.data(), g_model.image.size());
+      bool loaded = false;
+      void* k_ic = find_class("UnityEngine.ImageConversionModule", "UnityEngine", "ImageConversion");
+      void* m_load = k_ic ? find_method(k_ic, "LoadImage", 2, "UnityEngine.Texture2D") : nullptr;
+      if (m_load) {
+        void* r = call(m_load, nullptr, {tex, bytes});
+        loaded = r && unbox_int(r) != 0;
+      } else if (void* m_inst = find_method(k_tex, "LoadImage", 1, "System.Byte[]")) {
+        void* r = call(m_inst, tex, {bytes});
+        loaded = r && unbox_int(r) != 0;
+      }
+      if (loaded) g_tex = keep(tex);
+      else say(BEARITE_LOG_WARN, "texture could not be decoded, using the color only");
+    }
+  }
+
+  // mesh
+  void* mctor = find_method(k_mesh, ".ctor", 0);
+  g_mesh = mctor ? A.object_new(k_mesh) : nullptr;
+  if (!need(g_mesh, "Mesh constructor")) return false;
+  call(mctor, g_mesh);
+  keep(g_mesh);
+  g_cfg = read_config();
+  g_applied = g_cfg;
+  g_have_cfg = true;
+  upload_mesh(true);
+  say(BEARITE_LOG_INFO, "setup done (PaperPlane found, mesh built)");
+  g_ready = true;
+  return true;
+}
+
+// ---- applying ----
+
+static void set_state(Entry& e, bool on) {
+  if (!e.filter) return;
+  if (e.primary) {
+    call(m_set_shared, e.filter, {on ? g_mesh : e.orig_mesh});
+    if (g_exc) { e.dead = true; return; }
+    if (e.mat && m_set_tex && m_set_col) {
+      if (on) {
+        call(m_set_tex, e.mat, {g_tex});
+        call(m_set_col, e.mat, {g_model.color});
+      } else {
+        call(m_set_tex, e.mat, {e.orig_tex});
+        call(m_set_col, e.mat, {e.orig_col});
+      }
+    }
+  } else {
+    void* m = on ? nullptr : e.orig_mesh;
+    call(m_set_shared, e.filter, {m});
+    if (g_exc) e.dead = true;
+  }
+}
+
+static void apply_plane(void* plane) {
+  if (!g_ready || !plane) return;
+  int id = unbox_int(call(m_instid, plane));
+  if (std::find(g_seen.begin(), g_seen.end(), id) != g_seen.end()) return;
+  if (g_seen.size() > 512) { g_seen.clear(); g_entries.clear(); }
+  g_seen.push_back(id);
+  bool include_inactive = true;
+  void* arr = call(m_gcic, plane, {t_mf, &include_inactive});
+  size_t n = arr_len(arr);
+  say(BEARITE_LOG_INFO, "PaperPlane %d: %zu MeshFilter(s)", id, n);
+  bool primary_taken = false;
+  for (size_t i = 0; i < n; ++i) {
+    void* f = reinterpret_cast<void**>(arr_data(arr))[i];
+    if (!f) continue;
+    Entry e;
+    e.plane_id = id;
+    e.filter = keep(f);
+    e.orig_mesh = keep(call(m_get_shared, f));
+    if (!primary_taken) {
+      primary_taken = true;
+      e.primary = true;
+      void* mr = call(m_gc, f, {t_mr});
+      if (mr) {
+        e.mat = keep(call(m_get_mat, mr));
+        if (e.mat && m_get_tex && m_get_col) {
+          e.orig_tex = keep(call(m_get_tex, e.mat));
+          void* c = call(m_get_col, e.mat);
+          if (c) memcpy(e.orig_col, A.object_unbox(c), sizeof(e.orig_col));
+        }
+      } else {
+        say(BEARITE_LOG_WARN, "PaperPlane %d: no MeshRenderer on the main MeshFilter", id);
+      }
+    }
+    g_entries.push_back(e);
+    set_state(g_entries.back(), g_cfg.enabled);
+  }
+}
+
+static void scan() {
+  if (!g_ready) return;
+  int sort_mode = 0;
+  void* arr = m_find_by ? call(m_find, nullptr, {t_plane, &sort_mode}) : call(m_find, nullptr, {t_plane});
+  size_t n = arr_len(arr);
+  for (size_t i = 0; i < n; ++i) apply_plane(reinterpret_cast<void**>(arr_data(arr))[i]);
+}
+
+static void apply_all(bool on) {
+  for (Entry& e : g_entries) set_state(e, on);
+  g_entries.erase(std::remove_if(g_entries.begin(), g_entries.end(), [](const Entry& e) { return e.dead; }),
+                  g_entries.end());
+}
+
+static void update(float dt) {
+  if (g_failed) return;
+  const BeariteApi* api = bearite::api();
+  if (!api || !BEARITE_API_HAS(api, il2cpp_ready) || !api->il2cpp_ready(api)) return;
+  if (!g_ready && !setup()) return;
+  g_t_cfg += dt;
+  g_t_scan += dt;
+  if (g_t_cfg >= 0.5f) {
+    g_t_cfg = 0;
+    Config c = read_config();
+    if (!(c == g_applied)) {
+      bool toggled = c.enabled != g_applied.enabled;
+      bool moved = c.scale != g_applied.scale || c.yaw != g_applied.yaw || c.pitch != g_applied.pitch ||
+                   c.roll != g_applied.roll || c.offset_y != g_applied.offset_y;
+      g_cfg = c;
+      g_applied = c;
+      if (moved) upload_mesh(false);
+      if (toggled) apply_all(c.enabled);
+    }
+  }
+  if (g_t_scan >= 1.0f) {
+    g_t_scan = 0;
+    if (g_cfg.enabled) scan();
+  }
+}
+
+static void unload() {
+  if (g_ready) apply_all(false);
+}
+
+}  // namespace sk
+
+// ============================================================ 6. exports =====
+
+extern "C" {
+
+BEARITE_EXPORT int bearite_on_load(const BeariteApi* api) {
+  bearite::init(api);
+  if (api && api->mod_dir) sk::g_dir = api->mod_dir;
+  say(BEARITE_LOG_INFO, "Plane Skin loaded, mod dir: %s", sk::g_dir.c_str());
+  return 0;
+}
+
+BEARITE_EXPORT void bearite_on_update(float dt) { sk::update(dt); }
+
+BEARITE_EXPORT void bearite_on_unload(void) { sk::unload(); }
+
+// Manual entry points (same code path as the loader calls).
+BEARITE_EXPORT void sba_plane_init(const char* mod_dir) {
+  if (mod_dir) sk::g_dir = mod_dir;
+}
+
+BEARITE_EXPORT void sba_plane_scan(void) { sk::scan(); }
+
+BEARITE_EXPORT void sba_plane_apply(void* plane) { sk::apply_plane(plane); }
+
+}  // extern "C"
