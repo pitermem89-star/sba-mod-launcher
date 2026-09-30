@@ -1403,7 +1403,7 @@ BEARITE_EXPORT int bearite_on_load(const BeariteApi* api) {
                          reinterpret_cast<void*>(&hk_click), reinterpret_cast<void**>(&orig_click));
   bool c = bearite::hook(ASM_UI, "UnityEngine.UI", "Button", "OnSubmit", 1,
                          reinterpret_cast<void*>(&hk_submit), reinterpret_cast<void**>(&orig_submit));
-  bearite::log(BEARITE_LOG_INFO, TAG, "BUILD 3 loaded, hooks: Start=%d OnPointerClick=%d OnSubmit=%d", a, b, c);
+  bearite::log(BEARITE_LOG_INFO, TAG, "BUILD 4 loaded, hooks: Start=%d OnPointerClick=%d OnSubmit=%d", a, b, c);
   return (a && b && c) ? 0 : 1;
 }
 
