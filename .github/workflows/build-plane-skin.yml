@@ -1,0 +1,64 @@
+name: Build Plane Skin
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "examples/plane-skin/**"
+      - ".github/workflows/build-plane-skin.yml"
+
+env:
+  MOD_DIR: examples/plane-skin
+  MOD_ID: plane-skin
+  LIB_NAME: libplane_skin.so
+  API_LEVEL: 24
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find NDK
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CXX=$BIN/aarch64-linux-android${API_LEVEL}-clang++" >> "$GITHUB_ENV"
+          echo "STRIP=$BIN/llvm-strip" >> "$GITHUB_ENV"
+          echo "NM=$BIN/llvm-nm" >> "$GITHUB_ENV"
+
+      - name: Check sources exist
+        run: |
+          test -f "$MOD_DIR/plane_skin.cpp" || { echo "::error::$MOD_DIR/plane_skin.cpp not found"; exit 1; }
+          test -f "$MOD_DIR/mod.json" || { echo "::error::$MOD_DIR/mod.json not found"; exit 1; }
+
+      - name: Compile (arm64-v8a)
+        run: |
+          mkdir -p "dist/${MOD_ID}"
+          "$CXX" -std=c++17 -O2 -fPIC -shared \
+            -fvisibility=default -fno-exceptions -fno-rtti \
+            -I api -I loader/src -I "$MOD_DIR" \
+            "$MOD_DIR/plane_skin.cpp" \
+            -o "dist/${MOD_ID}/${LIB_NAME}" \
+            -static-libstdc++ -Wl,-z,max-page-size=16384 \
+            -ldl -llog
+          "$STRIP" --strip-unneeded "dist/${MOD_ID}/${LIB_NAME}"
+
+      - name: Show exported symbols
+        run: |
+          "$NM" -D --defined-only "dist/${MOD_ID}/${LIB_NAME}" | grep -E "sba_|bearite_" || echo "::warning::No sba_/bearite_ exports found"
+
+      - name: Package
+        run: |
+          cp "$MOD_DIR/mod.json" "dist/${MOD_ID}/mod.json"
+          if [ -f "$MOD_DIR/model.glb" ]; then
+            cp "$MOD_DIR/model.glb" "dist/${MOD_ID}/model.glb"
+          else
+            echo "::warning::model.glb not found in $MOD_DIR, add it next to the library"
+          fi
+          cd dist && zip -r "${MOD_ID}.zip" "${MOD_ID}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MOD_ID }}
+          path: dist/${{ env.MOD_ID }}.zip
