@@ -104,4 +104,41 @@ jobs:
           DOTNET_ROLL_FORWARD: Major
         run: |
           mkdir -p out
-          dotnet "$DLL" "$SO" "$META"
+          echo "Заголовок metadata (1-е число всегда 4205910959, 2-е = версия метаданных):"
+          od -An -tu4 -N8 "$META" | tee out/metadata_version.txt
+          dotnet "$DLL" "$SO" "$META" out < /dev/null 2>&1 | tee out/dumper.log
+          ls -la out
+          if [ ! -f out/dump.cs ]; then
+            echo "::error::Il2CppDumper не создал dump.cs, смотри вывод выше"
+            exit 1
+          fi
+
+      - name: Filter interesting classes
+        run: |
+          grep -n -i -E 'paper|plane|glider|airplane' out/dump.cs > out/plane_hits.txt || true
+          grep -n -i -E '^\s*(public|internal)?.*class .*(player|camera|vehicle|input|plane|paper|network|mirror|photon|netcode|lobby|multiplayer|discovery|transport)' out/dump.cs > out/classes_hits.txt || true
+          {
+            echo "## Совпадения: paper / plane / glider"
+            echo '```'
+            head -n 200 out/plane_hits.txt
+            echo '```'
+            echo "## Классы: player / camera / vehicle / input / network"
+            echo '```'
+            head -n 200 out/classes_hits.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: il2cpp-dump
+          path: |
+            out/dump.cs
+            out/plane_hits.txt
+            out/classes_hits.txt
+            out/script.json
+            out/dumper.log
+            out/metadata_version.txt
+          if-no-files-found: warn
+          retention-days: 14
