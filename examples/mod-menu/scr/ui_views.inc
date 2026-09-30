@@ -8,7 +8,7 @@ void build_cell(void* list_tr, const ModInfo& m, int index, float top, float bot
   if (!cell) return;
   void* cell_tr = call(u.m_go_get_tr, cell, {});
   rect(cell_tr, {0, bottom}, {1, top});
-  add_image(cell, {0.24f, 0.18f, 0.55f, 0.95f}, false);
+  add_image(cell, {0.24f, 0.18f, 0.55f, 0.95f}, true);  // rounded cell
 
   size_t n = defs ? defs->size() : 0;
   float hfrac = 1.0f / (1.0f + SETTING_ROW_UNITS * static_cast<float>(n));  // header share of the cell
@@ -30,7 +30,7 @@ void build_cell(void* list_tr, const ModInfo& m, int index, float top, float bot
   call(v.m_size, icon_tr, {&sz});
   if (u.m_set_apos) call(u.m_set_apos, icon_tr, {&pos});
   void* sprite = load_icon(m.dir);
-  void* img = add_image(icon, sprite ? Color{1, 1, 1, 1} : tile_color(m.name), false, sprite == nullptr);
+  void* img = add_image(icon, sprite ? Color{1, 1, 1, 1} : tile_color(m.name), true, sprite == nullptr);  // rounded icon
   if (sprite && img && v.m_set_sprite) call(v.m_set_sprite, img, {sprite});
   if (!sprite) {
     new_label(icon_tr, first_letter(m.name), 514, 46);
