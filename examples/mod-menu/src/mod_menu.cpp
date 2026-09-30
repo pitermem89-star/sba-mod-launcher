@@ -394,6 +394,7 @@ struct V {
   void *m_tmp_align, *m_tmp_size;
   void *m_tex_ctor, *m_tex_w, *m_tex_h, *m_load_image, *m_sprite_create;
   void *m_tex_ctor4, *m_tex_raw, *m_tex_apply, *m_sprite_create7, *m_image_type;
+  void *t_RectTransform, *t_Image, *t_Button;
   void *Mask, *t_Mask, *m_mask_show, *m_obj_name;
   bool ok = false;
 };
