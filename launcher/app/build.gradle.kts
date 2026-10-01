@@ -24,5 +24,5 @@ android {
 }
 
 dependencies {
-    implementation("com.android.tools.build:apksig:8.5.2")
+    implementation("com.github.vvb2060:Phantom:1.1.2") 
 }
