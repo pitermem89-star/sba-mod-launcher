@@ -95,27 +95,32 @@ class DexReader(private val data: ByteArray) {
 object PairipScan {
 
     fun run(ctx: Context): String {
-        val info = ctx.packageManager.getPackageInfo(Patcher.GAME, 0)
-        val app = info.applicationInfo ?: return "No app info."
-        val zip = ZipFile(File(app.sourceDir))
-        try {
-            val entry = zip.getEntry("classes.dex") ?: return "No classes.dex"
-            val bytes = zip.getInputStream(entry).use { it.readBytes() }
-            val sb = StringBuilder()
-            sb.append("classes.dex: ").append(bytes.size / 1024).append(" KB\n")
-            val list = DexReader(bytes).methods(PairipPatch.CLIENT)
-            var n = 0
-            for (m in list) {
-                if (m.name in PairipPatch.TARGETS && m.shorty.startsWith("V") && m.codeOff != 0) {
-                    sb.append("will neutralize: ").append(m.name).append(' ')
-                    sb.append(m.shorty).append(" units=").append(m.insnsSize).append('\n')
-                    n++
+        return try {
+            val info = ctx.packageManager.getPackageInfo(Patcher.GAME, 0)
+            val app = info.applicationInfo ?: return "Ошибка: Данные оригинального приложения не найдены."
+            val zip = ZipFile(File(app.sourceDir))
+            try {
+                val entry = zip.getEntry("classes.dex") ?: return "Внимание: Файл classes.dex не найден в APK."
+                val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                val sb = StringBuilder()
+                sb.append("Оригинальный classes.dex: ").append(bytes.size / 1024).append(" KB\n")
+                
+                val list = DexReader(bytes).methods(PairipPatch.CLIENT)
+                var n = 0
+                for (m in list) {
+                    if (m.name in PairipPatch.TARGETS && m.shorty.startsWith("V") && m.codeOff != 0) {
+                        sb.append("Обнаружен целевой метод защиты: ").append(m.name).append(' ')
+                        sb.append(m.shorty).append(" (размер блоков: ").append(m.insnsSize).append(")\n")
+                        n++
+                    }
                 }
+                sb.append("Сканирование завершено успешно. Обнаружено методов: ").append(n).append('\n')
+                sb.toString()
+            } finally {
+                zip.close()
             }
-            sb.append("Total: ").append(n).append('\n')
-            return sb.toString()
-        } finally {
-            zip.close()
+        } catch (e: Exception) {
+            "Ошибка при анализе оригинального APK: ${e.message}"
         }
     }
 }
