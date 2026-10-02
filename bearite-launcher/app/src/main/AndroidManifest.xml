@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Needed to see the game package on Android 11+ -->
+    <queries>
+        <package android:name="com.Earthkwak.Platformer" />
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:label="Bearite"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Bearite">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
