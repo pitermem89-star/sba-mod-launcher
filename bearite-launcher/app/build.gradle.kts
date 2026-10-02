@@ -5,6 +5,7 @@ plugins {
 }
 
 android {
+    // Жестко прописываем индентификатор приложения здесь
     namespace = "dev.bearite.launcher"
     compileSdk = 34
 
@@ -13,7 +14,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = "1.0.0"
     }
 
     compileOptions {
