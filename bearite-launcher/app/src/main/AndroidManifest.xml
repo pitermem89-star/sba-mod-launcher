@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://android.com"
-    package="dev.bearite.launcher">
+<manifest xmlns:android="http://android.com">
 
     <!-- Запросы для поиска оригинальной игры на Android 11+ -->
     <queries>
