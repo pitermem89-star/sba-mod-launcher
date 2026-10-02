@@ -15,7 +15,6 @@ fun readGame(ctx: Context): GameInfo = try {
     GameInfo(installed = false, versionName = null)
 }
 
-/** Starts the game. Returns false if it is not installed. */
 fun launchGame(ctx: Context): Boolean {
     val intent = ctx.packageManager.getLaunchIntentForPackage(GAME_PACKAGE) ?: return false
     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
