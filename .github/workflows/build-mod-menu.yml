@@ -19,6 +19,7 @@ jobs:
           set -eu
           SRC=examples/mod-menu/src/mod_menu.cpp
           MODJSON=examples/mod-menu/mod.json
+          EXPECT_BUILD="BUILD 5"
           if [ ! -f "$SRC" ]; then
             echo "::error::$SRC not found"
             find . -not -path './.git/*' -name '*mod_menu*'
@@ -31,14 +32,16 @@ jobs:
           echo "source: $SRC ($(wc -c < "$SRC") bytes)"
           echo "other copies (should be empty):"
           find . -name 'mod_menu*' -not -path './.git/*' -not -path "./$SRC" || true
-          grep -n "BUILD" "$SRC" || { echo "::error::source has no BUILD marker"; exit 1; }
+          grep -n "$EXPECT_BUILD" "$SRC" || { echo "::error::source has no '$EXPECT_BUILD' marker (old file?)"; exit 1; }
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
           mkdir -p out/mod-menu
           "$CXX" -std=c++17 -O2 -shared -fPIC -fvisibility=hidden -static-libstdc++ \
+            -Wl,-z,max-page-size=16384 \
             -I "$(dirname "$HPP")" "$SRC" \
             -o out/mod-menu/libmod-menu.so -ldl -llog
-          strings out/mod-menu/libmod-menu.so | grep -q "BUILD" || { echo "::error::built .so has no BUILD 3"; exit 1; }
+          strings out/mod-menu/libmod-menu.so | grep -q "$EXPECT_BUILD" || { echo "::error::built .so has no '$EXPECT_BUILD'"; exit 1; }
+          nm -D --defined-only out/mod-menu/libmod-menu.so | grep -q bearite_on_load || { echo "::error::bearite_on_load is not exported"; exit 1; }
           cp "$MODJSON" out/mod-menu/mod.json
           ls -la out/mod-menu
 
