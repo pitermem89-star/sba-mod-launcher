@@ -27,6 +27,8 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <type_traits>
+#include <utility>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -536,6 +538,28 @@ void release_state() {
   g.mods.clear();
   g.cfg_mod = -1;
   g.tab = 0;
+}
+
+// Unity "fake null": a destroyed UnityEngine.Object is still a non-null pointer
+// in native code, so ask Unity itself (Object.op_Implicit).
+bool alive(void* obj) {
+  if (!obj) return false;
+  static void* m = nullptr;
+  static bool tried = false;
+  if (!tried) { tried = true; m = find_method(u.Object, "op_Implicit", {"UnityEngine.Object"}); }
+  if (!m) return true;  // cannot check: assume alive
+  bool ok = false;
+  void* r = call(m, nullptr, {obj}, &ok);
+  return ok ? unbox_bool(r) : false;
+}
+
+// Menus built for other PauseMenuManager instances that may still be alive
+// (e.g. one in the main scene and one in the level). `g` is the active one.
+std::vector<State> g_other;
+
+void free_state(State& s) {
+  for (uint32_t h : s.h) g_il.gchandle_free(h);
+  s = State{};
 }
 
 void log_texts(const char* what, const std::vector<void*>& texts) {
@@ -1283,20 +1307,21 @@ void on_action(const Action& a) {
 
 // ----------------------------------------------------------- building ------
 
-void build(void* pause_menu) {
-  if (!init_unity()) return;
-  release_state();
+// Builds the button + window into the (already empty) global state `g`.
+// Returns false if anything went wrong; the caller then restores the old state.
+bool build_impl(void* pause_menu) {
+  if (!init_unity()) return false;
 
   char* base = static_cast<char*>(pause_menu);
   void* ach = *reinterpret_cast<void**>(base + OFF_ACHIEVEMENTS_BUTTON);
   void* about = *reinterpret_cast<void**>(base + OFF_ABOUT_WINDOW);
-  if (!ach || !about) { bearite::log(BEARITE_LOG_WARN, TAG, "achievementsButton/aboutWindow are null, skipping"); return; }
+  if (!ach || !about) { bearite::log(BEARITE_LOG_WARN, TAG, "achievementsButton/aboutWindow are null, skipping"); return false; }
 
   // ---- button
   void* ach_tr = transform(ach);
   void* parent = call(u.m_get_parent, ach_tr, {});
   void* btn_go = clone_next_to(game_object(ach), parent);
-  if (!btn_go) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloning the button failed"); return; }
+  if (!btn_go) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloning the button failed"); return false; }
   call(u.m_set_name, btn_go, {il_str("ModsButton")});
   strip_translate(btn_go);
 
@@ -1306,7 +1331,7 @@ void build(void* pause_menu) {
   for (size_t i = 1; i < btn_texts.size(); ++i) set_text(btn_texts[i], "");
   void* btn_tr = call(u.m_go_get_tr, btn_go, {});
   void* btn_comp = call(u.m_go_get_comp, btn_go, {u.t_Button});
-  if (!btn_comp || !btn_tr) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloned button has no Button component"); return; }
+  if (!btn_comp || !btn_tr) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloned button has no Button component"); call(u.m_destroy_imm, nullptr, {btn_go}); return false; }
 
   // Put it right after the original in the same column.
   int idx = unbox_int(call(u.m_get_sibling, ach_tr, {}));
@@ -1333,12 +1358,12 @@ void build(void* pause_menu) {
   void* about_tr = transform(about);
   void* about_parent = call(u.m_get_parent, about_tr, {});
   void* win_go = clone_next_to(game_object(about), about_parent);
-  if (!win_go) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloning the window failed"); return; }
+  if (!win_go) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloning the window failed"); call(u.m_destroy_imm, nullptr, {btn_go}); return false; }
   call(u.m_set_name, win_go, {il_str("ModsWindow")});
   strip_translate(win_go);
   void* win = call(u.m_go_get_comp, win_go, {u.t_UIWindow});
   void* win_tr = call(u.m_go_get_tr, win_go, {});
-  if (!win || !win_tr) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloned window has no UIWindow"); return; }
+  if (!win || !win_tr) { bearite::log(BEARITE_LOG_ERROR, TAG, "cloned window has no UIWindow"); call(u.m_destroy_imm, nullptr, {btn_go}); call(u.m_destroy_imm, nullptr, {win_go}); return false; }
   log_texts("window", components(win_go, u.t_TMP_Text));
   set_active(win_go, false);
 
@@ -1352,7 +1377,31 @@ void build(void* pause_menu) {
   pin(win_tr);
   prepare_window();
   bearite::log(BEARITE_LOG_INFO, TAG, "Mods button and window created");
+  return true;
 }
+
+// Never throws away a working menu unless the new one was built successfully,
+// and keeps menus of other still-living PauseMenuManagers working.
+void build(void* pause_menu) {
+  if (!init_unity()) return;
+
+  // Forget menus whose objects Unity has already destroyed (scene changed).
+  if (g.win_go && !alive(g.win_go)) free_state(g);
+  for (size_t i = 0; i < g_other.size();) {
+    if (!alive(g_other[i].win_go)) { free_state(g_other[i]); g_other.erase(g_other.begin() + static_cast<long>(i)); }
+    else ++i;
+  }
+
+  State prev = std::move(g);
+  g = State{};
+  if (build_impl(pause_menu)) {
+    if (prev.win_go) g_other.push_back(std::move(prev));
+  } else {
+    free_state(g);  // whatever the failed attempt pinned
+    g = std::move(prev);
+  }
+}
+
       // window contents, building the menu, actions
 // -------------------------------------------------------------- hooks ------
 
@@ -1362,11 +1411,13 @@ void (*orig_submit)(void*, void*, void*) = nullptr;
 
 void hk_start(void* self, void* mi) {
   orig_start(self, mi);
+  bearite::log(BEARITE_LOG_INFO, TAG, "PauseMenuManager.Start self=%p old btn=%p win=%p", self, g.btn, g.win);
   build(self);
+  bearite::log(BEARITE_LOG_INFO, TAG, "after build: btn=%p win=%p", g.btn, g.win);
 }
 
-// Returns true if the event was consumed by us.
-bool handle_press(void* button) {
+// Returns true if the event was consumed by us (for the active menu `g`).
+bool press_in_g(void* button) {
   if (!g.btn) return false;
   if (button == g.btn) { open_window(); return true; }
   auto act = g.actions.find(button);
@@ -1376,6 +1427,17 @@ bool handle_press(void* button) {
     return true;
   }
   if (inside_window(button)) { close_window(); return true; }
+  return false;
+}
+
+bool handle_press(void* button) {
+  if (press_in_g(button)) return true;
+  // Maybe the press belongs to a menu of another PauseMenuManager: make it active.
+  for (size_t i = 0; i < g_other.size(); ++i) {
+    std::swap(g, g_other[i]);
+    if (press_in_g(button)) return true;  // `g` stays the menu that was used
+    std::swap(g, g_other[i]);
+  }
   return false;
 }
 
@@ -1403,10 +1465,10 @@ BEARITE_EXPORT int bearite_on_load(const BeariteApi* api) {
                          reinterpret_cast<void*>(&hk_click), reinterpret_cast<void**>(&orig_click));
   bool c = bearite::hook(ASM_UI, "UnityEngine.UI", "Button", "OnSubmit", 1,
                          reinterpret_cast<void*>(&hk_submit), reinterpret_cast<void**>(&orig_submit));
-  bearite::log(BEARITE_LOG_INFO, TAG, "BUILD 4 loaded, hooks: Start=%d OnPointerClick=%d OnSubmit=%d", a, b, c);
+  bearite::log(BEARITE_LOG_INFO, TAG, "BUILD 5 loaded, hooks: Start=%d OnPointerClick=%d OnSubmit=%d", a, b, c);
   return (a && b && c) ? 0 : 1;
 }
 
-BEARITE_EXPORT void bearite_on_unload(void) { g.btn = nullptr; }
+BEARITE_EXPORT void bearite_on_unload(void) { g.btn = nullptr; for (auto& o : g_other) o.btn = nullptr; }
 
 }  // extern "C"
