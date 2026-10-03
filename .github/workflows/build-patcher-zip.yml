@@ -1,0 +1,55 @@
+name: Build patcher (zip)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'patcher.zip'
+      - '.github/workflows/build-patcher-zip.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Unpack patcher.zip
+        run: |
+          set -eu
+          ZIP=$(find . -maxdepth 3 -name patcher.zip -not -path './.git/*' | head -n1)
+          if [ -z "$ZIP" ]; then echo "::error::patcher.zip not found in the repo"; exit 1; fi
+          echo "zip: $ZIP ($(wc -c < "$ZIP") bytes)"
+          rm -rf work && mkdir work && unzip -q "$ZIP" -d work
+          S=$(find work -name settings.gradle.kts | head -n1)
+          if [ -z "$S" ]; then echo "::error::settings.gradle.kts is not inside the zip"; exit 1; fi
+          P=$(dirname "$S")
+          for f in libmain.so libbearite.so sign.p12; do
+            if [ ! -f "$P/prebuilt/$f" ]; then echo "::error::prebuilt/$f is missing in the zip"; exit 1; fi
+          done
+          mkdir -p "$P/app/src/main/assets"
+          cp "$P"/prebuilt/* "$P/app/src/main/assets/"
+          ls -la "$P/app/src/main/assets"
+          echo "PROJECT=$P" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        run: |
+          cd "$PROJECT"
+          gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Show result
+        run: ls -la "$PROJECT"/app/build/outputs/apk/debug/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bearite-patcher-run${{ github.run_number }}
+          path: ${{ env.PROJECT }}/app/build/outputs/apk/debug/*.apk
