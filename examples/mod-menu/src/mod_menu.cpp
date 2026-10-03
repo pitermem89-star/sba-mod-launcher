@@ -590,6 +590,8 @@ void* new_label(void* parent_tr, const std::string& text, int align, float size 
   return go;
 }
 
+void keep_asset(void* obj);
+
 // Tries <mod dir>/icon.png -> Sprite. Returns nullptr if anything is missing.
 void* load_icon(const std::string& dir) {
   if (!v.m_tex_ctor || !v.m_load_image || !v.m_sprite_create || !v.m_tex_w || !v.SystemByte) return nullptr;
@@ -608,7 +610,10 @@ void* load_icon(const std::string& dir) {
   float r[4] = {0, 0, w, h};
   float pivot[2] = {0.5f, 0.5f};
   pin(tex);
-  return call(v.m_sprite_create, nullptr, {tex, r, pivot});
+  keep_asset(tex);
+  void* sp = call(v.m_sprite_create, nullptr, {tex, r, pivot});
+  keep_asset(sp);
+  return sp;
 }
 
 Color tile_color(const std::string& name) {
@@ -654,6 +659,18 @@ void* fill_label(void* parent_tr, const std::string& text, int align, float size
 
 std::vector<uint32_t> g_keep;  // GC handles that live as long as the game (textures / sprites)
 
+// Textures / sprites made in code have no scene owner, so Unity deletes them in
+// Resources.UnloadUnusedAssets, which runs on every scene load (entering a level).
+// A GC handle does not count as a reference for Unity. Mark them as permanent.
+void keep_asset(void* obj) {
+  if (!obj || !u.ok) return;
+  static void* m_flags = find_method(u.Object, "set_hideFlags", {"UnityEngine.HideFlags"});
+  static void* m_ddol = find_method(u.Object, "DontDestroyOnLoad", {"UnityEngine.Object"});
+  int dont_unload = 32;  // HideFlags.DontUnloadUnusedAsset
+  call(m_flags, obj, {&dont_unload});
+  call(m_ddol, nullptr, {obj});
+}
+
 void* sprite_from_rgba(const std::vector<unsigned char>& px, int w, int h, float border) {
   if (!v.Texture2D || !v.m_tex_ctor4 || !v.m_tex_raw || !v.m_tex_apply || !v.m_sprite_create7 || !v.SystemByte) return nullptr;
   void* tex = g_il.object_new(v.Texture2D);
@@ -667,6 +684,7 @@ void* sprite_from_rgba(const std::vector<unsigned char>& px, int w, int h, float
   if (!ok) return nullptr;
   bool no = false;
   call(v.m_tex_apply, tex, {&no, &no});
+  keep_asset(tex);
   g_keep.push_back(g_il.gchandle_new(tex, 0));
 
   float r[4] = {0, 0, static_cast<float>(w), static_cast<float>(h)};
@@ -676,16 +694,16 @@ void* sprite_from_rgba(const std::vector<unsigned char>& px, int w, int h, float
   int mesh = 0;  // SpriteMeshType.FullRect
   float b[4] = {border, border, border, border};
   void* sprite = call(v.m_sprite_create7, nullptr, {tex, r, pivot, &ppu, &extrude, &mesh, b}, &ok);
-  if (sprite) g_keep.push_back(g_il.gchandle_new(sprite, 0));
+  if (sprite) { keep_asset(sprite); g_keep.push_back(g_il.gchandle_new(sprite, 0)); }
   return sprite;
 }
 
 // White rounded rectangle, 64x64, corner radius 22 px, used as a sliced Image.
 void* round_sprite() {
   static void* s = nullptr;
-  static bool tried = false;
-  if (tried) return s;
-  tried = true;
+  static bool failed = false;
+  if (s && alive(s)) return s;  // rebuilt if Unity destroyed it
+  if (failed) return nullptr;
   const int N = 64;
   const float R = 22.0f;
   std::vector<unsigned char> px(N * N * 4, 255);
@@ -698,16 +716,16 @@ void* round_sprite() {
       px[(y * N + x) * 4 + 3] = static_cast<unsigned char>(a * 255.0f);
     }
   s = sprite_from_rgba(px, N, N, R);
-  if (!s) bearite::log(BEARITE_LOG_WARN, TAG, "rounded sprite unavailable, using square panels");
+  if (!s) { failed = true; bearite::log(BEARITE_LOG_WARN, TAG, "rounded sprite unavailable, using square panels"); }
   return s;
 }
 
 // White gear (8 teeth, hole in the middle), 128x128.
 void* gear_sprite() {
   static void* s = nullptr;
-  static bool tried = false;
-  if (tried) return s;
-  tried = true;
+  static bool failed = false;
+  if (s && alive(s)) return s;  // rebuilt if Unity destroyed it
+  if (failed) return nullptr;
   const int N = 128;
   const float C = N / 2.0f;
   const float PI2 = 6.2831853f;
@@ -725,7 +743,7 @@ void* gear_sprite() {
       px[(y * N + x) * 4 + 3] = static_cast<unsigned char>(a * 255.0f);
     }
   s = sprite_from_rgba(px, N, N, 0);
-  if (!s) bearite::log(BEARITE_LOG_WARN, TAG, "gear sprite unavailable");
+  if (!s) { failed = true; bearite::log(BEARITE_LOG_WARN, TAG, "gear sprite unavailable"); }
   return s;
 }
         // procedurally drawn sprites (rounded rectangle, gear)
@@ -1465,7 +1483,7 @@ BEARITE_EXPORT int bearite_on_load(const BeariteApi* api) {
                          reinterpret_cast<void*>(&hk_click), reinterpret_cast<void**>(&orig_click));
   bool c = bearite::hook(ASM_UI, "UnityEngine.UI", "Button", "OnSubmit", 1,
                          reinterpret_cast<void*>(&hk_submit), reinterpret_cast<void**>(&orig_submit));
-  bearite::log(BEARITE_LOG_INFO, TAG, "BUILD 5 loaded, hooks: Start=%d OnPointerClick=%d OnSubmit=%d", a, b, c);
+  bearite::log(BEARITE_LOG_INFO, TAG, "BUILD 6 loaded, hooks: Start=%d OnPointerClick=%d OnSubmit=%d", a, b, c);
   return (a && b && c) ? 0 : 1;
 }
 
