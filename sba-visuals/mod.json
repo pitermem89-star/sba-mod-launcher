@@ -1,0 +1,21 @@
+{
+  "id": "sba-visuals",
+  "name": "SBA Visuals",
+  "version": "1.0.0",
+  "author": "spikle",
+  "library": "libsba-visuals.so",
+  "settings": [
+    { "key": "enabled", "label": "Включено", "type": "bool", "default": true },
+    { "key": "tint", "label": "Цветовой тон", "type": "choice",
+      "choices": ["off", "warm", "cool", "sunset", "night", "mint"], "default": "warm" },
+    { "key": "tint_strength", "label": "Сила тона", "type": "float",
+      "min": 0, "max": 0.6, "step": 0.05, "default": 0.15 },
+    { "key": "vignette", "label": "Виньетка", "type": "float",
+      "min": 0, "max": 1, "step": 0.1, "default": 0.4 },
+    { "key": "particles", "label": "Светящиеся частицы", "type": "bool", "default": true },
+    { "key": "particle_count", "label": "Количество частиц", "type": "int",
+      "min": 0, "max": 80, "step": 5, "default": 25 },
+    { "key": "particle_color", "label": "Цвет частиц", "type": "choice",
+      "choices": ["gold", "white", "pink", "cyan", "rainbow"], "default": "gold" }
+  ]
+}
