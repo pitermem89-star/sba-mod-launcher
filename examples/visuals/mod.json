@@ -1,7 +1,7 @@
 {
   "id": "visuals",
   "name": "Visual Styles",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "spikle",
   "library": "libvisuals.so",
   "settings": [
