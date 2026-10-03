@@ -1,0 +1,64 @@
+name: Build Visuals
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "examples/visuals/**"
+      - ".github/workflows/build-visuals.yml"
+
+env:
+  MOD_ID: visuals
+  LIB_NAME: libvisuals.so
+  API_LEVEL: 24
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find NDK
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CXX=$BIN/aarch64-linux-android${API_LEVEL}-clang++" >> "$GITHUB_ENV"
+          echo "STRIP=$BIN/llvm-strip" >> "$GITHUB_ENV"
+          echo "NM=$BIN/llvm-nm" >> "$GITHUB_ENV"
+
+      - name: Locate mod sources
+        run: |
+          SRC=$(find . -name visuals.cpp -not -path "./.git/*" | head -n 1)
+          if [ -z "$SRC" ]; then
+            echo "::error::visuals.cpp not found anywhere in the repo"
+            find . -maxdepth 3 -not -path "./.git/*" | sort
+            exit 1
+          fi
+          echo "MOD_DIR=$(dirname "$SRC")" >> "$GITHUB_ENV"
+          test -f "$(dirname "$SRC")/mod.json" || { echo "::error::mod.json not found next to visuals.cpp"; exit 1; }
+
+      - name: Compile (arm64-v8a)
+        run: |
+          mkdir -p "dist/${MOD_ID}"
+          "$CXX" -std=c++17 -O2 -fPIC -shared \
+            -fvisibility=default -fno-exceptions -fno-rtti \
+            -I api -I loader/src -I "$MOD_DIR" \
+            "$MOD_DIR/visuals.cpp" \
+            -o "dist/${MOD_ID}/${LIB_NAME}" \
+            -static-libstdc++ -Wl,-z,max-page-size=16384 \
+            -ldl -llog
+          "$STRIP" --strip-unneeded "dist/${MOD_ID}/${LIB_NAME}"
+
+      - name: Show exported symbols
+        run: |
+          "$NM" -D --defined-only "dist/${MOD_ID}/${LIB_NAME}" | grep bearite
+
+      - name: Package
+        run: |
+          cp "$MOD_DIR/mod.json" "dist/${MOD_ID}/mod.json"
+          cd dist && zip -r "${MOD_ID}.zip" "${MOD_ID}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MOD_ID }}
+          path: dist/${{ env.MOD_ID }}.zip
