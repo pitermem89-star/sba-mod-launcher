@@ -72,6 +72,7 @@ struct Api {
   char* (*type_get_name)(void*);
   void* (*runtime_invoke)(void*, void*, void**, void**);
   void* (*string_new)(const char*);
+  void* (*object_new)(void*);
   void* (*class_get_type)(void*);
   void* (*type_get_object)(void*);
   void* (*object_unbox)(void*);
@@ -107,6 +108,7 @@ static bool init() {
   L(type_get_name, "il2cpp_type_get_name");
   L(runtime_invoke, "il2cpp_runtime_invoke");
   L(string_new, "il2cpp_string_new");
+  L(object_new, "il2cpp_object_new");
   L(class_get_type, "il2cpp_class_get_type");
   L(type_get_object, "il2cpp_type_get_object");
   L(object_unbox, "il2cpp_object_unbox");
@@ -493,5 +495,3 @@ static bool skip_prop(const std::string& p) {
   std::string l = lower(p);
   return has(l, "spec") || has(l, "emiss") || has(l, "outline") || has(l, "reflect") || has(l, "rim");
 }
-
-static const std::vector<void*>& color_props(void* shader, const st
