@@ -9,6 +9,7 @@
 // Exports for the Bearite loader: bearite_on_load, bearite_on_update, bearite_on_unload.
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -54,6 +55,10 @@ struct Api {
   void** (*domain_get_assemblies)(void*, size_t*);
   void* (*assembly_get_image)(void*);
   const char* (*image_get_name)(void*);
+  size_t (*image_get_class_count)(void*);
+  void* (*image_get_class)(void*, size_t);
+  const char* (*class_get_name)(void*);
+  const char* (*class_get_namespace)(void*);
   void* (*class_from_name)(void*, const char*, const char*);
   void* (*class_get_methods)(void*, void**);
   void* (*class_get_parent)(void*);
@@ -90,6 +95,10 @@ static bool init() {
   L(domain_get_assemblies, "il2cpp_domain_get_assemblies");
   L(assembly_get_image, "il2cpp_assembly_get_image");
   L(image_get_name, "il2cpp_image_get_name");
+  L(image_get_class_count, "il2cpp_image_get_class_count");
+  L(image_get_class, "il2cpp_image_get_class");
+  L(class_get_name, "il2cpp_class_get_name");
+  L(class_get_namespace, "il2cpp_class_get_namespace");
   L(class_from_name, "il2cpp_class_from_name");
   L(class_get_methods, "il2cpp_class_get_methods");
   L(class_get_parent, "il2cpp_class_get_parent");
@@ -122,16 +131,21 @@ static bool name_match(const char* have, const char* want) {
   return strlen(want) == hl && strncmp(have, want, hl) == 0;
 }
 
-static void* find_class(const char* asm_name, const char* ns, const char* name) {
+static void* find_image(const char* asm_name) {
   size_t cnt = 0;
   void** list = A.domain_get_assemblies(A.domain_get(), &cnt);
   if (!list) return nullptr;
   for (size_t i = 0; i < cnt; ++i) {
     void* img = A.assembly_get_image(list[i]);
     const char* nm = img ? A.image_get_name(img) : nullptr;
-    if (nm && name_match(nm, asm_name)) return A.class_from_name(img, ns, name);
+    if (nm && name_match(nm, asm_name)) return img;
   }
   return nullptr;
+}
+
+static void* find_class(const char* asm_name, const char* ns, const char* name) {
+  void* img = find_image(asm_name);
+  return img ? A.class_from_name(img, ns, name) : nullptr;
 }
 
 // Method by name and argument count, looking through base classes.
@@ -352,6 +366,59 @@ static Config read_config() {
   return c;
 }
 
+// ---- diagnostics ----
+// Unity strips methods the game does not use, so first we look at what really exists.
+// Prints the declared methods of a class, "get_x"+"set_x" merged into  x[gs].
+static void log_methods(const char* label, void* klass) {
+  if (!klass) { say(BEARITE_LOG_WARN, "%s: class not found", label); return; }
+  std::vector<std::string> names;
+  std::vector<int> flags;
+  void* it = nullptr;
+  while (void* m = A.class_get_methods(klass, &it)) {
+    std::string n = A.method_get_name(m);
+    int f = 0;
+    if (n.compare(0, 4, "get_") == 0) { n = n.substr(4); f = 1; }
+    else if (n.compare(0, 4, "set_") == 0) { n = n.substr(4); f = 2; }
+    size_t i = 0;
+    while (i < names.size() && !(names[i] == n && (flags[i] != 0) == (f != 0))) ++i;
+    if (i == names.size()) { names.push_back(n); flags.push_back(f); }
+    else flags[i] |= f;
+  }
+  std::string line = std::string(label) + ":";
+  for (size_t i = 0; i < names.size(); ++i) {
+    std::string item = " " + names[i];
+    if (flags[i]) item += std::string("[") + ((flags[i] & 1) ? "g" : "") + ((flags[i] & 2) ? "s" : "") + "]";
+    if (line.size() + item.size() > 360) { say(BEARITE_LOG_INFO, "%s", line.c_str()); line = "  ..."; }
+    line += item;
+  }
+  say(BEARITE_LOG_INFO, "%s", line.c_str());
+}
+
+// Game classes that look related to light, sky, weather or the camera.
+static void log_game_classes() {
+  void* img = find_image("Assembly-CSharp");
+  if (!img || !A.image_get_class_count || !A.image_get_class || !A.class_get_name) return;
+  static const char* kWords[] = {"light", "sky", "fog", "night", "weather", "environment", "post",
+                                 "volume", "camera", "graphic", "quality", "render", "sun", "shader", "theme"};
+  size_t cnt = A.image_get_class_count(img);
+  std::string line = "game classes:";
+  int shown = 0;
+  for (size_t i = 0; i < cnt && shown < 90; ++i) {
+    void* k = A.image_get_class(img, i);
+    if (!k) continue;
+    std::string n = A.class_get_name(k);
+    std::string low = n;
+    for (char& c : low) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    bool hit = false;
+    for (const char* w : kWords) if (low.find(w) != std::string::npos) hit = true;
+    if (!hit) continue;
+    ++shown;
+    if (line.size() + n.size() > 360) { say(BEARITE_LOG_INFO, "%s", line.c_str()); line = "  ..."; }
+    line += " " + n;
+  }
+  say(BEARITE_LOG_INFO, "%s (%d)", line.c_str(), shown);
+}
+
 // ---- setup ----
 static bool need(void* p, const char* what) {
   if (!p) { say(BEARITE_LOG_ERROR, "setup failed: %s not found", what); g_failed = true; return false; }
@@ -400,15 +467,26 @@ static bool setup() {
   o_find_all = find_method(k_obj, "FindObjectsOfType", 1, "System.Type");
   if (!o_find_all) { o_find_all = find_method(k_obj, "FindObjectsByType", 2, "System.Type"); o_find_by = o_find_all != nullptr; }
 
-  if (!need(rs_get_amb, "RenderSettings.ambientLight") || !need(rs_set_amb, "RenderSettings.set_ambientLight") ||
-      !need(rs_get_amode, "RenderSettings.ambientMode") || !need(rs_get_fog, "RenderSettings.fog") ||
-      !need(rs_get_fcol, "RenderSettings.fogColor") || !need(rs_get_fden, "RenderSettings.fogDensity") ||
-      !need(rs_get_sky, "RenderSettings.skybox") || !need(l_get_col, "Light.color") ||
-      !need(l_set_col, "Light.set_color") || !need(l_get_int, "Light.intensity") ||
-      !need(l_set_int, "Light.set_intensity") || !need(l_get_xf, "Light.transform") ||
-      !need(xf_get_euler, "Transform.eulerAngles") || !need(xf_set_euler, "Transform.set_eulerAngles") ||
-      !need(m_set_col, "Material.SetColor") || !need(m_has, "Material.HasProperty"))
-    return false;
+  // Methods the game does not use may be stripped. Do not fail: use what exists, log the rest.
+  struct Probe { const char* name; void* m; };
+  const Probe probes[] = {
+      {"RenderSettings.ambientLight", rs_get_amb}, {"RenderSettings.set_ambientLight", rs_set_amb},
+      {"RenderSettings.ambientMode", rs_get_amode}, {"RenderSettings.set_ambientMode", rs_set_amode},
+      {"RenderSettings.fog", rs_get_fog}, {"RenderSettings.set_fog", rs_set_fog},
+      {"RenderSettings.fogColor", rs_get_fcol}, {"RenderSettings.set_fogColor", rs_set_fcol},
+      {"RenderSettings.fogDensity", rs_get_fden}, {"RenderSettings.set_fogDensity", rs_set_fden},
+      {"RenderSettings.skybox", rs_get_sky}, {"RenderSettings.sun", rs_get_sun},
+      {"Light.color", l_get_col}, {"Light.set_color", l_set_col}, {"Light.intensity", l_get_int},
+      {"Light.set_intensity", l_set_int}, {"Light.transform", l_get_xf},
+      {"Transform.eulerAngles", xf_get_euler}, {"Transform.set_eulerAngles", xf_set_euler},
+      {"Material.HasProperty", m_has}, {"Material.SetColor", m_set_col}, {"Material.SetFloat", m_set_f},
+  };
+  std::string missing;
+  for (const Probe& p : probes) if (!p.m) missing += std::string(" ") + p.name;
+  say(BEARITE_LOG_INFO, "missing methods:%s", missing.empty() ? " none" : missing.c_str());
+  log_methods("RenderSettings", k_rs);
+  log_methods("Light", k_light);
+  log_game_classes();
 
   // Which render pipeline? (only for the log, helps to tune the styles)
   if (void* k_gs = find_class(core, "UnityEngine.Rendering", "GraphicsSettings")) {
