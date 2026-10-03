@@ -1,16 +1,22 @@
-// visuals.cpp: "Visual Styles" mod for Super Bear Adventure (v0.2).
+// visuals.cpp: "Visual Styles" mod for Super Bear Adventure (v0.3).
 //
-// The game's shaders ignore Unity lighting (sun / ambient), so changing
-// lights only recolours the sky. This version tints the colour of EVERY
-// material in the game (world, trees, houses, characters, sky) and, if
-// the game allows it, adds fog. Style 0 puts everything back exactly as it was.
+// The game's shaders ignore Unity lighting, so changing lights only recolours
+// the sky. This mod therefore:
+//   1. tints EVERY colour property of EVERY material (found per shader, so
+//      flowers, sprites and characters are covered too),
+//   2. adds fog,
+//   3. turns on real shadows: sun light shadows + shadow casting for the
+//      player (skinned meshes and anything whose root is called player/bear/hero),
+//   4. for sunset/night rotates the sun so the shadows get long.
+// Style 0 puts everything back exactly as it was.
 //
-// Every optional step can fail on its own without stopping the mod.
-// Everything it finds (or does not find) is written to bearite.log.
+// Every step can fail on its own without stopping the mod. What it finds
+// (or does not find) is written to bearite.log.
 //
 // Exports for the Bearite loader: bearite_on_load, bearite_on_update, bearite_on_unload.
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -198,23 +204,37 @@ static std::string str_utf8(void* s) {  // managed string -> ASCII
 // ============================================================ 2. styles
 
 struct Col { float r = 0, g = 0, b = 0, a = 1; };
+struct V3 { float x = 0, y = 0, z = 0; };
 
 static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+static float lerp_angle(float a, float b, float t) {
+  float d = std::fmod(b - a, 360.0f);
+  if (d > 180) d -= 360;
+  if (d < -180) d += 360;
+  return a + d * t;
+}
 
 struct Style {
   const char* name;
-  float world[3];   // colour multiplier for world, characters, objects
-  float sky[3];     // colour multiplier for the sky material
-  float fog_col[3]; // fog colour
-  float fog_den;    // fog density (0 = do not touch fog)
+  float world[3];    // colour multiplier for world, characters, objects
+  float sky[3];      // colour multiplier for the sky material
+  float mix_col[3];  // washed-out colour that colours are blended towards
+  float mix;         // 0 = only multiply, 1 = fully mix_col
+  float fog_col[3];  // fog colour
+  float fog_den;     // fog density (0 = do not touch fog)
+  bool set_sun;      // rotate the sun (longer shadows)?
+  V3 sun_euler;      // sun angle: X = height above the horizon, Y = direction
 };
 
 // Index = value of the "style" setting. 0 = the game as it was.
 static const Style kStyles[4] = {
-    {"day (original)", {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, 0.0f},
-    {"sunset", {1.12f, 0.76f, 0.56f}, {1.25f, 0.70f, 0.60f}, {1.0f, 0.55f, 0.32f}, 0.004f},
-    {"night", {0.30f, 0.40f, 0.80f}, {0.20f, 0.26f, 0.65f}, {0.04f, 0.06f, 0.18f}, 0.010f},
-    {"pastel", {1.10f, 1.08f, 1.18f}, {1.10f, 1.10f, 1.30f}, {0.85f, 0.90f, 1.0f}, 0.005f},
+    {"day (original)", {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, 0.0f, {1, 1, 1}, 0.0f, false, {}},
+    {"sunset", {1.12f, 0.76f, 0.56f}, {1.25f, 0.70f, 0.60f}, {1.0f, 0.6f, 0.4f}, 0.0f,
+     {1.0f, 0.55f, 0.32f}, 0.004f, true, {16, -35, 0}},
+    {"night", {0.30f, 0.40f, 0.80f}, {0.20f, 0.26f, 0.65f}, {0.1f, 0.15f, 0.4f}, 0.0f,
+     {0.04f, 0.06f, 0.18f}, 0.010f, true, {60, -30, 0}},
+    {"pastel", {1.02f, 1.0f, 1.08f}, {1.1f, 1.1f, 1.3f}, {0.96f, 0.91f, 1.0f}, 0.30f,
+     {0.85f, 0.90f, 1.0f}, 0.006f, false, {}},
 };
 
 // ============================================================ 3. mod
@@ -227,8 +247,10 @@ struct Config {
   bool enabled = true;
   int style = 0;
   float strength = 1;
+  bool shadows = true;
   bool operator==(const Config& o) const {
-    return enabled == o.enabled && style == o.style && std::fabs(strength - o.strength) < 0.001f;
+    return enabled == o.enabled && style == o.style && shadows == o.shadows &&
+           std::fabs(strength - o.strength) < 0.001f;
   }
 };
 
@@ -239,28 +261,32 @@ static int g_tries = 0;
 static float g_t_retry = 10, g_t_cfg = 10, g_t_scan = 10;
 
 // classes and methods
-static void *k_mat, *t_mat;
-static void *m_has, *m_get_col, *m_set_col, *m_get_shader, *m_get_exp_dummy;
-static void *o_get_name, *find_all;
+static void *k_mat, *t_mat, *t_rend, *t_skin, *t_light;
+static void *m_has, *m_get_col, *m_set_col, *m_get_shader;
+static void *o_get_name, *find_res, *find_scene;
+static void *sh_count, *sh_pname, *sh_ptype;
 static void *rs_get_fog, *rs_set_fog, *rs_get_fmode, *rs_set_fmode, *rs_get_fcol, *rs_set_fcol,
     *rs_get_fden, *rs_set_fden;
-static bool g_fog_ok = false;
+static void *comp_get_xf, *xf_get_root, *xf_get_euler, *xf_set_euler;
+static void *l_get_type, *l_get_sh, *l_set_sh, *l_get_sstr, *l_set_sstr;
+static void *r_get_cast, *r_set_cast;
+static void *qs_get_sh, *qs_set_sh, *qs_get_dist, *qs_set_dist;
+static bool g_fog_ok = false, g_generic = false, g_shadow_ok = false, g_qs_ok = false;
 
-// property names, created once as managed strings
-static const char* kProps[] = {"_Color", "_BaseColor", "_TintColor", "_Tint", "_SkyTint", "_GroundColor"};
-static const int kPropCount = sizeof(kProps) / sizeof(kProps[0]);
-static void* g_prop[kPropCount];
 static void* g_exposure_str = nullptr;
+static const char* kLegacy[] = {"_Color", "_BaseColor", "_TintColor", "_Tint", "_SkyTint", "_MainColor"};
+static std::vector<void*> g_legacy;
 
 struct Entry {
   void* mat;
-  int prop;
+  void* prop;  // managed string
   Col orig;
   bool sky;
 };
 static std::vector<Entry> g_entries;
 static std::map<void*, int> g_known;
-static std::map<std::string, int> g_shader_count;
+static std::map<std::string, std::vector<void*>> g_shader_props;
+static std::map<std::string, int> g_shader_tinted, g_shader_noprop;
 static int g_skipped = 0;
 
 struct FogOrig { bool valid = false; bool fog = false; int mode = 0; Col col; float den = 0; };
@@ -271,6 +297,11 @@ static Col get_col(void* m, void* obj, void* arg) {
   Col c;
   if (void* r = call(m, obj, {arg})) memcpy(&c, A.object_unbox(r), sizeof(Col));
   return c;
+}
+static V3 get_v3(void* m, void* obj) {
+  V3 v;
+  if (void* r = call(m, obj)) memcpy(&v, A.object_unbox(r), sizeof(V3));
+  return v;
 }
 static float get_f(void* m, void* obj) {
   void* r = call(m, obj);
@@ -284,12 +315,24 @@ static bool get_b(void* m, void* obj, std::initializer_list<void*> a = {}) {
   void* r = call(m, obj, a);
   return r && *static_cast<uint8_t*>(A.object_unbox(r)) != 0;
 }
-static void set_f(void* m, float f) { call(m, nullptr, {&f}); }
-static void set_i(void* m, int i) { call(m, nullptr, {&i}); }
-static void set_b(void* m, bool b) { uint8_t v = b ? 1 : 0; call(m, nullptr, {&v}); }
-static void set_c(void* m, Col c) { call(m, nullptr, {&c}); }
+static int call_i1(void* m, void* obj, int a) {  // method(int) -> enum/int
+  void* r = call(m, obj, {&a});
+  return r ? *static_cast<int*>(A.object_unbox(r)) : -1;
+}
+static void* call_p1(void* m, void* obj, int a) { return call(m, obj, {&a}); }
+
+static void seti_o(void* m, void* obj, int i) { call(m, obj, {&i}); }
+static void setf_o(void* m, void* obj, float f) { call(m, obj, {&f}); }
+static void setb_o(void* m, void* obj, bool b) { uint8_t v = b ? 1 : 0; call(m, obj, {&v}); }
+static void setv_o(void* m, void* obj, V3 v) { call(m, obj, {&v}); }
 
 static std::string obj_name(void* o) { return o ? str_utf8(call(o_get_name, o)) : std::string(); }
+
+static std::string lower(std::string s) {
+  for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+static bool has(const std::string& s, const char* part) { return s.find(part) != std::string::npos; }
 
 // ---- settings.json in the mod folder first (always fresh), then the loader
 static bool file_value(const std::string& text, const char* key, double& out) {
@@ -327,6 +370,7 @@ static Config read_config() {
   if (get_setting_num(file, "enabled", v)) c.enabled = v != 0;
   if (get_setting_num(file, "style", v)) c.style = static_cast<int>(v);
   if (get_setting_num(file, "strength", v)) c.strength = static_cast<float>(v);
+  if (get_setting_num(file, "shadows", v)) c.shadows = v != 0;
   c.style = std::min(3, std::max(0, c.style));
   c.strength = std::min(1.0f, std::max(0.0f, c.strength));
   return c;
@@ -340,6 +384,13 @@ static bool setup() {
   void* k_obj = find_class(core, "UnityEngine", "Object");
   void* k_res = find_class(core, "UnityEngine", "Resources");
   void* k_rs = find_class(core, "UnityEngine", "RenderSettings");
+  void* k_shader = find_class(core, "UnityEngine", "Shader");
+  void* k_rend = find_class(core, "UnityEngine", "Renderer");
+  void* k_skin = find_class(core, "UnityEngine", "SkinnedMeshRenderer");
+  void* k_comp = find_class(core, "UnityEngine", "Component");
+  void* k_xf = find_class(core, "UnityEngine", "Transform");
+  void* k_light = find_class(core, "UnityEngine", "Light");
+  void* k_qs = find_class(core, "UnityEngine", "QualitySettings");
   if (!k_mat || !k_obj) {
     say(BEARITE_LOG_WARN, "setup: Material/Object class not found yet (try %d)", g_tries);
     return false;
@@ -352,20 +403,27 @@ static bool setup() {
   m_get_shader = find_method(k_mat, "get_shader", 0);
   o_get_name = find_method(k_obj, "get_name", 0);
 
-  find_all = find_method(k_res, "FindObjectsOfTypeAll", 1, "System.Type");
+  find_res = find_method(k_res, "FindObjectsOfTypeAll", 1, "System.Type");
   const char* find_src = "Resources.FindObjectsOfTypeAll";
-  if (!find_all) { find_all = find_method(k_obj, "FindObjectsOfType", 1, "System.Type"); find_src = "Object.FindObjectsOfType"; }
+  if (!find_res) { find_res = find_method(k_obj, "FindObjectsOfType", 1, "System.Type"); find_src = "Object.FindObjectsOfType"; }
+  find_scene = find_method(k_obj, "FindObjectsOfType", 1, "System.Type");
 
-  say(BEARITE_LOG_INFO, "methods: HasProperty=%d GetColor=%d SetColor=%d get_shader=%d get_name=%d find=%s(%d)",
+  // generic colour-property discovery
+  sh_count = find_method(k_shader, "GetPropertyCount", 0);
+  sh_pname = find_method(k_shader, "GetPropertyName", 1, "System.Int32");
+  sh_ptype = find_method(k_shader, "GetPropertyType", 1, "System.Int32");
+  g_generic = sh_count && sh_pname && sh_ptype;
+
+  say(BEARITE_LOG_INFO, "methods: HasProperty=%d GetColor=%d SetColor=%d get_shader=%d get_name=%d find=%s(%d) generic=%d",
       m_has != nullptr, m_get_col != nullptr, m_set_col != nullptr, m_get_shader != nullptr,
-      o_get_name != nullptr, find_src, find_all != nullptr);
+      o_get_name != nullptr, find_src, find_res != nullptr, g_generic);
 
-  if (!m_has || !m_get_col || !m_set_col || !o_get_name || !find_all) {
+  if (!m_has || !m_get_col || !m_set_col || !o_get_name || !find_res) {
     say(BEARITE_LOG_ERROR, "setup failed: a required Material method was not found");
     return false;
   }
 
-  for (int i = 0; i < kPropCount; ++i) g_prop[i] = keep(A.string_new(kProps[i]));
+  for (const char* p : kLegacy) g_legacy.push_back(keep(A.string_new(p)));
   g_exposure_str = keep(A.string_new("_Exposure"));
 
   // fog is optional
@@ -386,6 +444,39 @@ static bool setup() {
     say(BEARITE_LOG_WARN, "fog: RenderSettings fog methods not found, fog is skipped");
   }
 
+  // shadows are optional too
+  comp_get_xf = find_method(k_comp, "get_transform", 0);
+  xf_get_root = find_method(k_xf, "get_root", 0);
+  xf_get_euler = find_method(k_xf, "get_eulerAngles", 0);
+  xf_set_euler = find_method(k_xf, "set_eulerAngles", 1);
+  l_get_type = find_method(k_light, "get_type", 0);
+  l_get_sh = find_method(k_light, "get_shadows", 0);
+  l_set_sh = find_method(k_light, "set_shadows", 1);
+  l_get_sstr = find_method(k_light, "get_shadowStrength", 0);
+  l_set_sstr = find_method(k_light, "set_shadowStrength", 1);
+  r_get_cast = find_method(k_rend, "get_shadowCastingMode", 0);
+  r_set_cast = find_method(k_rend, "set_shadowCastingMode", 1);
+  qs_get_sh = find_method(k_qs, "get_shadows", 0);
+  qs_set_sh = find_method(k_qs, "set_shadows", 1);
+  qs_get_dist = find_method(k_qs, "get_shadowDistance", 0);
+  qs_set_dist = find_method(k_qs, "set_shadowDistance", 1);
+  if (k_rend) t_rend = type_object(k_rend);
+  if (k_skin) t_skin = type_object(k_skin);
+  if (k_light) t_light = type_object(k_light);
+  g_shadow_ok = find_scene && t_rend && t_light && comp_get_xf && xf_get_root && l_get_type &&
+                l_set_sh && l_set_sstr && r_get_cast && r_set_cast;
+  g_qs_ok = qs_get_sh && qs_set_sh && qs_get_dist && qs_set_dist;
+  say(BEARITE_LOG_INFO, "shadows: ok=%d quality=%d skinned=%d sun_rotate=%d",
+      g_shadow_ok, g_qs_ok, t_skin != nullptr, xf_set_euler != nullptr && xf_get_euler != nullptr);
+
+  // what the render pipeline is (helps to understand shadows)
+  if (void* k_gs = find_class(core, "UnityEngine.Rendering", "GraphicsSettings")) {
+    void* m = find_method(k_gs, "get_currentRenderPipeline", 0);
+    if (!m) m = find_method(k_gs, "get_renderPipelineAsset", 0);
+    void* rp = m ? call(m, nullptr) : nullptr;
+    say(BEARITE_LOG_INFO, "render pipeline: %s", rp ? obj_name(rp).c_str() : "built-in");
+  }
+
   say(BEARITE_LOG_INFO, "setup done");
   g_ready = true;
   return true;
@@ -393,158 +484,14 @@ static bool setup() {
 
 // ---- finding materials
 static bool skip_shader(const std::string& s) {
-  static const char* bad[] = {"UI/", "UI-", "TextMeshPro", "TMP", "Sprites/", "Hidden/", "GUI", "Text"};
-  for (const char* b : bad) if (s.find(b) != std::string::npos) return true;
+  static const char* bad[] = {"UI/", "UI-", "TextMeshPro", "TMP", "Hidden/", "GUI", "Text"};
+  for (const char* b : bad) if (has(s, b)) return true;
   return false;
 }
 
-static void examine(void* mat) {
-  std::string sname = m_get_shader ? obj_name(call(m_get_shader, mat)) : std::string("?");
-  if (g_exc) return;
-  if (skip_shader(sname)) { ++g_skipped; return; }
-  bool sky = sname.find("Skybox") != std::string::npos ||
-             (g_exposure_str && get_b(m_has, mat, {g_exposure_str}));
-  bool any = false;
-  for (int i = 0; i < kPropCount; ++i) {
-    if (!get_b(m_has, mat, {g_prop[i]})) continue;
-    Col c = get_col(m_get_col, mat, g_prop[i]);
-    if (g_exc) continue;
-    g_entries.push_back({mat, i, c, sky});
-    any = true;
-  }
-  if (any) ++g_shader_count[sname + (sky ? " [sky]" : "")];
+static bool skip_prop(const std::string& p) {
+  std::string l = lower(p);
+  return has(l, "spec") || has(l, "emiss") || has(l, "outline") || has(l, "reflect") || has(l, "rim");
 }
 
-static bool scan() {
-  void* arr = call(find_all, nullptr, {t_mat});
-  if (g_exc || !arr) return false;
-  size_t n = arr_len(arr);
-  void** items = reinterpret_cast<void**>(arr_data(arr));
-  bool added = false;
-  size_t before = g_entries.size();
-  for (size_t i = 0; i < n; ++i) {
-    void* m = items[i];
-    if (!m || g_known.count(m)) continue;
-    keep(m);
-    g_known[m] = 1;
-    examine(m);
-  }
-  added = g_entries.size() != before;
-  if (added) say(BEARITE_LOG_INFO, "materials: %zu found, %zu colours tracked, %d skipped (UI/text)", g_known.size(), g_entries.size(), g_skipped);
-  return added;
-}
-
-static void log_shaders() {
-  int shown = 0;
-  for (auto& kv : g_shader_count) {
-    if (++shown > 14) break;
-    say(BEARITE_LOG_INFO, "shader: %s x%d", kv.first.c_str(), kv.second);
-  }
-}
-
-// ---- applying
-static void apply_fog(const Style* st, float t) {
-  if (!g_fog_ok || !g_fog.valid) return;
-  if (st && t > 0.001f && st->fog_den > 0) {
-    set_b(rs_set_fog, true);
-    set_i(rs_set_fmode, 3);  // FogMode.ExponentialSquared
-    Col c = {lerpf(g_fog.col.r, st->fog_col[0], t), lerpf(g_fog.col.g, st->fog_col[1], t),
-             lerpf(g_fog.col.b, st->fog_col[2], t), 1};
-    set_c(rs_set_fcol, c);
-    set_f(rs_set_fden, lerpf(g_fog.fog ? g_fog.den : 0.0f, st->fog_den, t));
-  } else {
-    set_b(rs_set_fog, g_fog.fog);
-    set_i(rs_set_fmode, g_fog.mode);
-    set_c(rs_set_fcol, g_fog.col);
-    set_f(rs_set_fden, g_fog.den);
-  }
-}
-
-// st = nullptr or t = 0 puts the original look back.
-static void apply(const Style* st, float t) {
-  bool on = st && t > 0.001f;
-  if (!on && !g_touched) return;
-  for (size_t i = 0; i < g_entries.size();) {
-    Entry& e = g_entries[i];
-    Col c = e.orig;
-    if (on) {
-      const float* m = e.sky ? st->sky : st->world;
-      c.r *= lerpf(1, m[0], t);
-      c.g *= lerpf(1, m[1], t);
-      c.b *= lerpf(1, m[2], t);
-    }
-    call(m_set_col, e.mat, {g_prop[e.prop], &c});
-    if (g_exc) {  // the material was destroyed, forget it
-      g_entries.erase(g_entries.begin() + static_cast<long>(i));
-      continue;
-    }
-    ++i;
-  }
-  g_touched = on;
-  apply_fog(on ? st : nullptr, t);
-}
-
-static void apply_config() {
-  if (!g_cfg.enabled || g_cfg.style == 0) apply(nullptr, 0);
-  else apply(&kStyles[g_cfg.style], g_cfg.strength);
-}
-
-static void update(float dt) {
-  if (g_dead) return;
-  if (!g_ready) {
-    g_t_retry += dt;
-    if (g_t_retry < 3.0f) return;
-    g_t_retry = 0;
-    if (++g_tries > 12) {
-      g_dead = true;
-      say(BEARITE_LOG_ERROR, "giving up after %d tries", g_tries - 1);
-      return;
-    }
-    if (!setup()) return;
-  }
-  g_t_cfg += dt;
-  g_t_scan += dt;
-  bool dirty = false;
-
-  if (g_t_cfg >= 0.5f) {
-    g_t_cfg = 0;
-    Config c = read_config();
-    if (!(c == g_cfg)) {
-      say(BEARITE_LOG_INFO, "style: %s%s strength=%.2f", kStyles[c.style].name, c.enabled ? "" : " (off)", c.strength);
-      g_cfg = c;
-      dirty = true;
-    }
-  }
-
-  if (g_t_scan >= 2.0f) {
-    g_t_scan = 0;
-    bool first = g_known.empty();
-    if (scan()) dirty = true;
-    if (first && !g_known.empty()) log_shaders();
-    if (!dirty && g_touched) apply_fog(&kStyles[g_cfg.style], g_cfg.strength);  // game may reset fog
-  }
-
-  if (dirty) apply_config();
-}
-
-static void unload() {
-  if (g_ready && g_touched) apply(nullptr, 0);
-}
-
-}  // namespace vis
-
-// ============================================================ 4. exports
-
-extern "C" {
-
-BEARITE_EXPORT int bearite_on_load(const BeariteApi* api) {
-  bearite::init(api);
-  if (api && api->mod_dir) vis::g_dir = api->mod_dir;
-  say(BEARITE_LOG_INFO, "Visual Styles 0.2 loaded, mod dir: %s", vis::g_dir.c_str());
-  return 0;
-}
-
-BEARITE_EXPORT void bearite_on_update(float dt) { vis::update(dt); }
-
-BEARITE_EXPORT void bearite_on_unload(void) { vis::unload(); }
-}  // extern "C"
+static const std::vector<void*>& color_props(void* shader, const st
