@@ -40,7 +40,6 @@ fun BeariteApp() {
     val scope = rememberCoroutineScope()
     var patchStatus by remember { mutableStateOf("Готов к работе") }
 
-    // Обновляем статус игры каждый раз, когда лаунчер возвращается на экран
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         game = readGame(context)
     }
@@ -77,6 +76,7 @@ fun BeariteApp() {
                         }
                     }
                 )
+                // Используем функции из файла Screens.kt, чтобы избежать конфликтов дублирования
                 Tab.Mods -> PlaceholderScreen("Установленные моды будут здесь")
                 Tab.Logs -> PlaceholderScreen(patchStatus)
                 Tab.Settings -> SettingsScreen()
@@ -92,10 +92,8 @@ fun HomeScreen(
     onLaunch: () -> Unit, 
     onPatch: () -> Unit
 ) {
-    // Отслеживание процесса, чтобы заблокировать кнопку от двойных нажатий
     var isPatching by remember { mutableStateOf(false) }
 
-    // Автоматический сброс анимации загрузки, если патчер вернул финальный статус
     LaunchedEffect(patchStatus) {
         if (patchStatus.contains("успешно") || patchStatus.contains("Ошибка")) {
             isPatching = false
@@ -108,7 +106,6 @@ fun HomeScreen(
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Карточка информации о целевой игре
         ElevatedCard(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp)) {
             Column(modifier = Modifier.padding(20.dp)) {
                 Text("Super Bear Adventure", style = MaterialTheme.typography.titleMedium)
@@ -120,7 +117,6 @@ fun HomeScreen(
             }
         }
 
-        // Кнопка запуска ванильной (оригинальной) игры
         Button(
             onClick = onLaunch,
             enabled = game.installed && !isPatching,
@@ -131,13 +127,11 @@ fun HomeScreen(
             Text("Запустить игру")
         }
 
-        // АКТИВНАЯ КНОПКА СБОРКИ ПАТЧА
         FilledTonalButton(
             onClick = {
                 isPatching = true
                 onPatch()
             },
-            // Разблокируется сама, если игра установлена на устройстве
             enabled = game.installed && !isPatching,
             modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 20.dp)
         ) {
@@ -154,7 +148,6 @@ fun HomeScreen(
             }
         }
 
-        // СТРОКА ГОТОВНОСТИ (PROGRESS BAR) И ЛОГИ СБОРКИ
         ElevatedCard(
             modifier = Modifier
                 .fillMaxWidth()
@@ -164,7 +157,6 @@ fun HomeScreen(
                 Text("Статус операции:", style = MaterialTheme.typography.titleSmall)
                 Spacer(Modifier.height(8.dp))
                 
-                // Линейный индикатор: бежит во время процесса слияния, замирает по окончании
                 if (isPatching && !patchStatus.contains("успешно") && !patchStatus.contains("Ошибка")) {
                     LinearProgressIndicator(
                         modifier = Modifier.fillMaxWidth(),
@@ -180,7 +172,6 @@ fun HomeScreen(
                 
                 Spacer(Modifier.height(12.dp))
                 
-                // Текстовое поле вывода логов
                 Text(
                     text = patchStatus,
                     style = MaterialTheme.typography.bodySmall,
@@ -188,21 +179,5 @@ fun HomeScreen(
                 )
             }
         }
-    }
-}
-
-@Composable
-fun PlaceholderScreen(text: String) {
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text(text, style = MaterialTheme.typography.bodyLarge)
-    }
-}
-
-@Composable
-fun SettingsScreen() {
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        ListItem(headlineContent = { Text("Лаунчер: Bearite") })
-        ListItem(headlineContent = { Text("Цель: com.Earthkwak.Platformer") })
-        ListItem(headlineContent = { Text("Версия: 0.1.0") })
     }
 }
