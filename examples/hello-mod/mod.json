@@ -1,7 +1,0 @@
-{
-  "id": "hello-mod",
-  "name": "Hello Mod",
-  "version": "1.0.0",
-  "author": "you",
-  "library": "libhello.so"
-}
