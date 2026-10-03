@@ -19,7 +19,7 @@ jobs:
           set -eu
           SRC=examples/mod-menu/src/mod_menu.cpp
           MODJSON=examples/mod-menu/mod.json
-          EXPECT_BUILD="BUILD 5"
+          EXPECT_BUILD="BUILD 6"
           if [ ! -f "$SRC" ]; then
             echo "::error::$SRC not found"
             find . -not -path './.git/*' -name '*mod_menu*'
