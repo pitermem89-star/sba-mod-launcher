@@ -6,6 +6,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
@@ -13,6 +18,48 @@ jobs:
         run: |
           rm -rf launcher
           unzip -q launcher.zip
+
+      - name: Найти libbearite.so и вшить в лаунчер
+        run: |
+          DEST=launcher/app/src/main/assets/libbearite.so
+          mkdir -p "$(dirname "$DEST")"
+
+          # 1. файл лежит прямо в репозитории
+          F="$(git ls-files | grep -i 'libbearite\.so$' | head -n1 || true)"
+          if [ -n "$F" ]; then cp "$F" "$DEST"; echo "Взял из репозитория: $F"; fi
+
+          # 2. файл приложен к одному из релизов
+          if [ ! -s "$DEST" ]; then
+            for tag in $(gh release list --limit 30 --json tagName --jq '.[].tagName'); do
+              if gh release download "$tag" -p 'libbearite.so' -O "$DEST" 2>/dev/null && [ -s "$DEST" ]; then
+                echo "Взял из релиза $tag"; break
+              fi
+              rm -f "$DEST"
+            done
+          fi
+
+          # 3. файл лежит в результатах прошлых сборок (artifacts)
+          if [ ! -s "$DEST" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.expired==false) | select((.name|test("il2cpp|Launcher";"i"))|not) | "\(.id) \(.name)"' > arts.txt || true
+            while read -r id name; do
+              [ -z "$id" ] && continue
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > a.zip 2>/dev/null || continue
+              ENTRY="$(unzip -Z1 a.zip 2>/dev/null | grep -i 'libbearite\.so$' | grep -i 'arm64' | head -n1 || true)"
+              [ -z "$ENTRY" ] && ENTRY="$(unzip -Z1 a.zip 2>/dev/null | grep -i 'libbearite\.so$' | head -n1 || true)"
+              if [ -n "$ENTRY" ]; then
+                unzip -p a.zip "$ENTRY" > "$DEST"
+                echo "Взял из артефакта $name ($ENTRY)"
+                break
+              fi
+            done < arts.txt
+          fi
+
+          if [ ! -s "$DEST" ] || [ "$(head -c4 "$DEST" | tail -c3)" != "ELF" ]; then
+            echo "::error::Не нашёл libbearite.so ни в репозитории, ни в релизах, ни в артефактах. Сначала запусти сборку загрузчика модов (Bearite), потом эту."
+            exit 1
+          fi
+          ls -la "$DEST"
 
       - uses: actions/setup-java@v4
         with:
