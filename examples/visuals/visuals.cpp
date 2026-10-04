@@ -1,5 +1,6 @@
-// visuals.cpp: "Visual Styles" mod for Super Bear Adventure (v0.7).
+// visuals.cpp: "Visual Styles" mod for Super Bear Adventure (v0.8).
 //
+// v0.8: real glow/colour grading through the game's own Post-Processing Stack v2 (see "post-processing").
 // v0.7: ad removal moved to its own mod ("No Ads", examples/no-ads); colours are softer; a flat colour grade covers everything the material tint misses (paths, snow, signs, portals).
 //
 // The game's shaders ignore Unity lighting, so changing lights only recolours
@@ -82,6 +83,10 @@ struct Api {
   void (*free_mem)(void*);
   const uint16_t* (*string_chars)(void*);
   int32_t (*string_length)(void*);
+  void* (*class_get_field_from_name)(void*, const char*);
+  size_t (*field_get_offset)(void*);
+  void* (*object_get_class)(void*);
+  void* (*array_new)(void*, size_t);
   bool ok = false;
 };
 static Api A;
@@ -118,6 +123,10 @@ static bool init() {
   L(free_mem, "il2cpp_free");
   L(string_chars, "il2cpp_string_chars");
   L(string_length, "il2cpp_string_length");
+  L(class_get_field_from_name, "il2cpp_class_get_field_from_name");
+  L(field_get_offset, "il2cpp_field_get_offset");
+  L(object_get_class, "il2cpp_object_get_class");
+  L(array_new, "il2cpp_array_new");
 #undef L
   A.ok = A.domain_get && A.domain_get_assemblies && A.assembly_get_image && A.image_get_name &&
          A.class_from_name && A.class_get_methods && A.class_get_parent && A.method_get_name &&
@@ -773,6 +782,205 @@ static void apply_shadows() {
   }
 }
 
+// ---- post-processing: the game ships Unity's Post-Processing Stack v2 (found in its metadata).
+// If a camera already has a PostProcessLayer, the mod adds one global volume with Bloom (the glow),
+// ColorGrading (warm/cool colour) and Vignette, and fades it with the "strength" setting. Nothing
+// is added to cameras that have no PostProcessLayer. All steps are logged with "pp:".
+struct PPStyle {
+  float bloom_int, bloom_thr, bloom_knee, bloom_diff;
+  float bloom_col[3];
+  float temp, tint, sat, contrast, exposure;
+  float filter[3];
+  float vig_int, vig_smooth;
+  float vig_col[3];
+};
+static const PPStyle kPP[4] = {
+    {0, 1, 0.5f, 7, {1, 1, 1}, 0, 0, 0, 0, 0, {1, 1, 1}, 0, 0.5f, {0, 0, 0}},
+    // sunset: strong warm glow, warm filter, dark purple corners
+    {1.6f, 0.85f, 0.6f, 7, {1.0f, 0.70f, 0.40f}, 25, 8, 18, 12, 0.0f, {1.0f, 0.88f, 0.78f},
+     0.28f, 0.4f, {0.20f, 0.05f, 0.10f}},
+    // night: cool moonlight, a bit darker, blue corners
+    {1.8f, 0.75f, 0.6f, 7, {0.50f, 0.60f, 1.0f}, -28, 6, 5, 18, -0.35f, {0.62f, 0.72f, 1.0f},
+     0.40f, 0.45f, {0.0f, 0.02f, 0.10f}},
+    // pastel: soft pink glow, lower contrast, brighter
+    {1.0f, 0.95f, 0.7f, 8, {1.0f, 0.85f, 0.95f}, 5, 10, 14, -12, 0.25f, {1.0f, 0.96f, 1.0f},
+     0.15f, 0.6f, {1.0f, 0.90f, 0.97f}},
+};
+
+static bool g_pp_ok = false, g_pp_resolved = false, g_pp_failed = false;
+static void *pp_t_layer = nullptr, *pp_k_set = nullptr, *pp_k_bloom = nullptr, *pp_k_grade = nullptr,
+            *pp_k_vig = nullptr, *pp_so_create = nullptr, *pp_get_inst = nullptr, *pp_quick = nullptr,
+            *pp_get_enabled = nullptr;
+static void *pp_vol = nullptr, *pp_bloom = nullptr, *pp_grade = nullptr, *pp_vig = nullptr;
+static int pp_style_applied = -1;
+static long pp_layers_seen = -1;
+
+static long foff(void* obj, const char* name) {
+  if (!obj || !A.object_get_class || !A.class_get_field_from_name || !A.field_get_offset) return -1;
+  void* k = A.object_get_class(obj);
+  void* f = k ? A.class_get_field_from_name(k, name) : nullptr;
+  return f ? static_cast<long>(A.field_get_offset(f)) : -1;
+}
+template <class T> static bool fset(void* obj, const char* name, T v) {
+  long o = foff(obj, name);
+  if (o < 0) return false;
+  memcpy(static_cast<uint8_t*>(obj) + o, &v, sizeof(T));
+  return true;
+}
+template <class T> static bool fget(void* obj, const char* name, T& v) {
+  long o = foff(obj, name);
+  if (o < 0) return false;
+  memcpy(&v, static_cast<uint8_t*>(obj) + o, sizeof(T));
+  return true;
+}
+// A ParameterOverride<T> field of a settings object: mark it overridden and set its value.
+template <class T> static bool param(void* settings, const char* name, T v) {
+  void* p = nullptr;
+  if (!fget(settings, name, p) || !p) return false;
+  uint8_t on = 1;
+  if (!fset(p, "overrideState", on)) return false;
+  return fset(p, "value", v);
+}
+
+static bool pp_resolve() {
+  if (g_pp_resolved) return !g_pp_failed;
+  g_pp_resolved = true;
+  const char* as = "Unity.Postprocessing.Runtime";
+  const char* ns = "UnityEngine.Rendering.PostProcessing";
+  void* k_layer = find_class(as, ns, "PostProcessLayer");
+  pp_k_set = find_class(as, ns, "PostProcessEffectSettings");
+  pp_k_bloom = find_class(as, ns, "Bloom");
+  pp_k_grade = find_class(as, ns, "ColorGrading");
+  pp_k_vig = find_class(as, ns, "Vignette");
+  void* k_ppm = find_class(as, ns, "PostProcessManager");
+  void* k_so = find_class("UnityEngine.CoreModule", "UnityEngine", "ScriptableObject");
+  void* k_beh = find_class("UnityEngine.CoreModule", "UnityEngine", "Behaviour");
+  pp_so_create = find_method(k_so, "CreateInstance", 1, "System.Type");
+  pp_get_inst = find_method(k_ppm, "get_instance", 0);
+  pp_quick = find_method(k_ppm, "QuickVolume", 3);
+  pp_get_enabled = find_method(k_beh, "get_enabled", 0);
+  say(BEARITE_LOG_INFO,
+      "pp: classes layer=%d settings=%d bloom=%d grading=%d vignette=%d manager=%d | methods create=%d instance=%d quick=%d enabled=%d | fields api=%d%d%d%d",
+      k_layer != nullptr, pp_k_set != nullptr, pp_k_bloom != nullptr, pp_k_grade != nullptr,
+      pp_k_vig != nullptr, k_ppm != nullptr, pp_so_create != nullptr, pp_get_inst != nullptr,
+      pp_quick != nullptr, pp_get_enabled != nullptr, A.class_get_field_from_name != nullptr,
+      A.field_get_offset != nullptr, A.object_get_class != nullptr, A.array_new != nullptr);
+  if (!k_layer || !pp_k_set || !pp_k_bloom || !pp_k_grade || !pp_k_vig || !pp_so_create || !pp_get_inst ||
+      !pp_quick || !pp_get_enabled || !A.class_get_field_from_name || !A.field_get_offset ||
+      !A.object_get_class || !A.array_new || !find_res) {
+    say(BEARITE_LOG_WARN, "pp: something required was not found, post-processing is off");
+    g_pp_failed = true;
+    return false;
+  }
+  pp_t_layer = type_object(k_layer);
+  return true;
+}
+
+static void pp_apply() {
+  if (!pp_vol) return;
+  bool on = g_cfg.enabled && g_cfg.style > 0 && g_cfg.strength > 0.001f;
+  if (on && pp_style_applied != g_cfg.style) {
+    const PPStyle& q = kPP[g_cfg.style];
+    int bad = 0;
+    Col bc = {q.bloom_col[0], q.bloom_col[1], q.bloom_col[2], 1};
+    Col fc = {q.filter[0], q.filter[1], q.filter[2], 1};
+    Col vc = {q.vig_col[0], q.vig_col[1], q.vig_col[2], 1};
+    bad += !param<float>(pp_bloom, "intensity", q.bloom_int);
+    bad += !param<float>(pp_bloom, "threshold", q.bloom_thr);
+    bad += !param<float>(pp_bloom, "softKnee", q.bloom_knee);
+    bad += !param<float>(pp_bloom, "diffusion", q.bloom_diff);
+    bad += !param<Col>(pp_bloom, "color", bc);
+    bad += !param<int>(pp_grade, "gradingMode", 2);  // HighDefinitionRange
+    bad += !param<float>(pp_grade, "temperature", q.temp);
+    bad += !param<float>(pp_grade, "tint", q.tint);
+    bad += !param<float>(pp_grade, "saturation", q.sat);
+    bad += !param<float>(pp_grade, "contrast", q.contrast);
+    bad += !param<float>(pp_grade, "postExposure", q.exposure);
+    bad += !param<Col>(pp_grade, "colorFilter", fc);
+    bad += !param<float>(pp_vig, "intensity", q.vig_int);
+    bad += !param<float>(pp_vig, "smoothness", q.vig_smooth);
+    bad += !param<Col>(pp_vig, "color", vc);
+    say(bad ? BEARITE_LOG_WARN : BEARITE_LOG_INFO, "pp: style %s applied, %d parameter(s) could not be set",
+        kStyles[g_cfg.style].name, bad);
+    pp_style_applied = g_cfg.style;
+  }
+  fset<float>(pp_vol, "weight", on ? g_cfg.strength : 0.0f);
+}
+
+static bool pp_create_volume() {
+  auto mk = [&](void* k) -> void* {
+    void* o = call(pp_so_create, nullptr, {type_object(k)});
+    return g_exc ? nullptr : keep(o);
+  };
+  pp_bloom = mk(pp_k_bloom);
+  pp_grade = mk(pp_k_grade);
+  pp_vig = mk(pp_k_vig);
+  if (!pp_bloom || !pp_grade || !pp_vig) {
+    say(BEARITE_LOG_WARN, "pp: could not create the effect objects");
+    pp_bloom = pp_grade = pp_vig = nullptr;
+    g_pp_failed = true;
+    return false;
+  }
+  int bad = 0;
+  uint8_t one = 1;
+  bad += !param<uint8_t>(pp_bloom, "enabled", one);
+  bad += !param<uint8_t>(pp_grade, "enabled", one);
+  bad += !param<uint8_t>(pp_vig, "enabled", one);
+  void* arr = A.array_new(pp_k_set, 3);
+  if (!arr) { g_pp_failed = true; return false; }
+  keep(arr);
+  void** items = reinterpret_cast<void**>(arr_data(arr));
+  items[0] = pp_bloom;
+  items[1] = pp_grade;
+  items[2] = pp_vig;
+  void* inst = call(pp_get_inst, nullptr);
+  int layer = 0;
+  float prio = 100.0f;
+  void* v = (!g_exc && inst) ? call(pp_quick, inst, {&layer, &prio, arr}) : nullptr;
+  if (g_exc || !v) {
+    say(BEARITE_LOG_WARN, "pp: QuickVolume failed, post-processing is off");
+    g_pp_failed = true;
+    return false;
+  }
+  pp_vol = keep(v);
+  pp_style_applied = -1;
+  float zero = 0;
+  fset<float>(pp_vol, "weight", zero);
+  say(BEARITE_LOG_INFO, "pp: global volume created (%d enabled flag(s) not set)", bad);
+  return true;
+}
+
+// Called every few seconds. Returns true if post-processing switched on or off.
+static bool pp_tick() {
+  if (g_pp_failed || !pp_resolve()) return false;
+  bool before = g_pp_ok;
+  void* arr = call(find_res, nullptr, {pp_t_layer});
+  size_t n = (g_exc || !arr) ? 0 : arr_len(arr);
+  size_t active = 0;
+  void** items = n ? reinterpret_cast<void**>(arr_data(arr)) : nullptr;
+  for (size_t i = 0; i < n; ++i) {
+    void* l = items[i];
+    if (!l) continue;
+    void* en = call(pp_get_enabled, l);
+    if (!g_exc && en && *static_cast<uint8_t*>(A.object_unbox(en))) ++active;
+    int mask = 0;
+    if (fget(l, "volumeLayer", mask) && !(mask & 1)) fset<int>(l, "volumeLayer", mask | 1);
+  }
+  if (static_cast<long>(n) != pp_layers_seen) {
+    say(BEARITE_LOG_INFO, "pp: %zu PostProcessLayer object(s) in the game, %zu enabled%s", n, active,
+        n ? "" : " (post-processing is not used by this camera, using the colour fallback)");
+    pp_layers_seen = static_cast<long>(n);
+  }
+  if (pp_vol) {  // is our volume still alive?
+    call(pp_get_enabled, pp_vol);
+    if (g_exc) { pp_vol = nullptr; pp_style_applied = -1; }
+  }
+  if (!pp_vol && active > 0) pp_create_volume();
+  g_pp_ok = pp_vol && active > 0;
+  if (g_pp_ok) pp_apply();
+  return g_pp_ok != before;
+}
+
 // ---- glow overlay: a soft glow and a vignette drawn over the world, under the HUD.
 // Two UI images on their own overlay canvas (sorting order below the game's HUD).
 struct V2 { float x = 0, y = 0; };
@@ -994,14 +1202,17 @@ static void apply_glow(float pulse = 1.0f) {
     g_glow_style = g_cfg.style;
   }
   float s = g_cfg.strength;
-  set_color_on(glow_img, g.glow_col[0], g.glow_col[1], g.glow_col[2], std::min(1.0f, g.glow_a * s * pulse));
-  set_color_on(grade_img, g.grade_col[0], g.grade_col[1], g.grade_col[2], std::min(1.0f, g.grade_a * s));
-  set_color_on(vig_img, g.vig_col[0], g.vig_col[1], g.vig_col[2], std::min(1.0f, g.vig_a * s));
+  // with real post-processing the overlay only helps a little (the glow and vignette are done there)
+  float ppk = g_pp_ok ? 0.0f : 1.0f;
+  set_color_on(glow_img, g.glow_col[0], g.glow_col[1], g.glow_col[2], std::min(1.0f, g.glow_a * s * pulse * (g_pp_ok ? 0.35f : 1.0f)));
+  set_color_on(grade_img, g.grade_col[0], g.grade_col[1], g.grade_col[2], std::min(1.0f, g.grade_a * s * (g_pp_ok ? 0.3f : 1.0f)));
+  set_color_on(vig_img, g.vig_col[0], g.vig_col[1], g.vig_col[2], std::min(1.0f, g.vig_a * s * ppk));
 }
 
 static void apply_config() {
   if (!g_cfg.enabled || g_cfg.style == 0) apply(nullptr, 0);
-  else apply(&kStyles[g_cfg.style], g_cfg.strength);
+  else apply(&kStyles[g_cfg.style], g_cfg.strength * (g_pp_ok ? 0.4f : 1.0f));
+  pp_apply();
   apply_shadows();
   apply_glow();
 }
@@ -1042,10 +1253,11 @@ static void update(float dt) {
     if (scan_materials()) dirty = true;
     if (first && !g_known.empty()) log_shaders();
     if (scan_renderers()) dirty = true;
+    if (pp_tick()) dirty = true;
     refresh_sun();
     if (!dirty) {
       // the game may reset fog / shadows by itself
-      if (g_touched) apply_fog(&kStyles[g_cfg.style], g_cfg.strength);
+      if (g_touched) apply_fog(&kStyles[g_cfg.style], g_cfg.strength * (g_pp_ok ? 0.4f : 1.0f));
       apply_shadows();
     }
   }
@@ -1063,6 +1275,8 @@ static void update(float dt) {
 static void unload() {
   if (!g_ready) return;
   if (g_touched) apply(nullptr, 0);
+  if (pp_vol) fset<float>(pp_vol, "weight", 0.0f);
+  g_pp_ok = false;
   g_cfg.shadows = false;
   apply_shadows();
   g_cfg.style = 0;
@@ -1078,7 +1292,7 @@ extern "C" {
 BEARITE_EXPORT int bearite_on_load(const BeariteApi* api) {
   bearite::init(api);
   if (api && api->mod_dir) vis::g_dir = api->mod_dir;
-  say(BEARITE_LOG_INFO, "Visual Styles 0.7 loaded, mod dir: %s", vis::g_dir.c_str());
+  say(BEARITE_LOG_INFO, "Visual Styles 0.8 loaded, mod dir: %s", vis::g_dir.c_str());
   return 0;
 }
 
