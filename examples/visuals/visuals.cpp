@@ -1,6 +1,6 @@
 // visuals.cpp: "Visual Styles" mod for Super Bear Adventure (v0.7).
 //
-// v0.7: ad removal moved to its own mod ("No Ads", examples/no-ads); colours are softer.
+// v0.7: ad removal moved to its own mod ("No Ads", examples/no-ads); colours are softer; a flat colour grade covers everything the material tint misses (paths, snow, signs, portals).
 //
 // The game's shaders ignore Unity lighting, so changing lights only recolours
 // the sky. This mod therefore:
@@ -784,17 +784,22 @@ struct GlowStyle {
   float rect[4];  // where the glow sits on screen (0..1, x0 y0 x1 y1, 0,0 = bottom left)
   float vig_col[3];
   float vig_a;
+  float grade_col[3];  // flat colour over EVERYTHING (also objects whose material has no tintable colour)
+  float grade_a;
 };
 
 static const GlowStyle kGlow[4] = {
-    {{0, 0, 0}, 0.0f, {0, 0, 1, 1}, {0, 0, 0}, 0.0f},
-    {{1.0f, 0.62f, 0.30f}, 0.38f, {0.30f, 0.10f, 1.15f, 1.25f}, {0.25f, 0.08f, 0.05f}, 0.35f},
-    {{0.35f, 0.45f, 1.0f}, 0.30f, {0.35f, 0.35f, 1.2f, 1.3f}, {0.0f, 0.01f, 0.08f}, 0.55f},
-    {{1.0f, 0.88f, 0.95f}, 0.30f, {-0.2f, -0.2f, 1.2f, 1.2f}, {1.0f, 0.93f, 0.97f}, 0.30f},
+    {{0, 0, 0}, 0.0f, {0, 0, 1, 1}, {0, 0, 0}, 0.0f, {0, 0, 0}, 0.0f},
+    {{1.0f, 0.62f, 0.30f}, 0.38f, {0.30f, 0.10f, 1.15f, 1.25f}, {0.25f, 0.08f, 0.05f}, 0.35f,
+     {1.0f, 0.50f, 0.22f}, 0.24f},
+    {{0.35f, 0.45f, 1.0f}, 0.30f, {0.35f, 0.35f, 1.2f, 1.3f}, {0.0f, 0.01f, 0.08f}, 0.55f,
+     {0.08f, 0.12f, 0.40f}, 0.34f},
+    {{1.0f, 0.88f, 0.95f}, 0.30f, {-0.2f, -0.2f, 1.2f, 1.2f}, {1.0f, 0.93f, 0.97f}, 0.30f,
+     {0.95f, 0.85f, 1.0f}, 0.16f},
 };
 
 static void *glow_root = nullptr, *glow_img = nullptr, *vig_img = nullptr, *glow_xf = nullptr,
-            *vig_xf = nullptr;
+            *vig_xf = nullptr, *grade_img = nullptr, *grade_xf = nullptr;
 static void *go_ctor, *go_addc, *go_get_xf, *go_set_active, *xf_set_parent, *dont_destroy;
 static void *rt_amin, *rt_amax, *rt_omin, *rt_omax, *cv_set_mode, *cv_set_order;
 static void *img_set_sprite, *gr_set_color, *gr_set_ray;
@@ -958,7 +963,7 @@ static bool glow_build() {
     xf_out = keep(xf);
     return true;
   };
-  if (!layer("Vignette", spr_vig, vig_img, vig_xf) || !layer("Glow", spr_glow, glow_img, glow_xf)) {
+  if (!layer("Grade", nullptr, grade_img, grade_xf) || !layer("Vignette", spr_vig, vig_img, vig_xf) || !layer("Glow", spr_glow, glow_img, glow_xf)) {
     say(BEARITE_LOG_ERROR, "glow: could not create the image layers, glow is off");
     g_glow_failed = true;
     return false;
@@ -985,10 +990,12 @@ static void apply_glow(float pulse = 1.0f) {
   if (g_glow_style != g_cfg.style) {
     set_rect(glow_xf, g.rect[0], g.rect[1], g.rect[2], g.rect[3]);
     set_rect(vig_xf, 0, 0, 1, 1);
+    set_rect(grade_xf, 0, 0, 1, 1);
     g_glow_style = g_cfg.style;
   }
   float s = g_cfg.strength;
   set_color_on(glow_img, g.glow_col[0], g.glow_col[1], g.glow_col[2], std::min(1.0f, g.glow_a * s * pulse));
+  set_color_on(grade_img, g.grade_col[0], g.grade_col[1], g.grade_col[2], std::min(1.0f, g.grade_a * s));
   set_color_on(vig_img, g.vig_col[0], g.vig_col[1], g.vig_col[2], std::min(1.0f, g.vig_a * s));
 }
 
