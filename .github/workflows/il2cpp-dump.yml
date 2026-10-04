@@ -1,0 +1,177 @@
+name: il2cpp-dump
+
+# Берёт файл игры из релиза (по умолчанию тег v1 в этом же репозитории),
+# достаёт libil2cpp.so + global-metadata.dat и делает дамп через Il2CppDumper.
+# Запуск: Actions -> il2cpp-dump -> Run workflow.
+# После дампа показывает в Summary классы игрока / движения (для мода-читов).
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Репозиторий с релизом (owner/name). Пусто = этот репозиторий"
+        required: false
+        default: ""
+      tag:
+        description: "Тег релиза, где лежит игра"
+        required: false
+        default: "v1"
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ inputs.repo != '' && inputs.repo || github.repository }}
+      TAG: ${{ inputs.tag != '' && inputs.tag || 'v1' }}
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            6.0.x
+            8.0.x
+
+      - name: Download game from release
+        run: |
+          mkdir -p game
+          gh release download "$TAG" -R "$REPO" --dir game
+          ls -la game
+
+      - name: Unpack apk / xapk / apks
+        run: |
+          shopt -s nullglob
+          mkdir -p x
+          for f in game/*.apk game/*.xapk game/*.apks game/*.zip; do
+            n="$(basename "$f")"
+            d="x/${n%.*}"
+            mkdir -p "$d"
+            unzip -q -o "$f" -d "$d" || true
+          done
+          # вложенные apk (xapk / apks / split-пакеты)
+          find x -name '*.apk' | while read -r a; do
+            d="${a%.apk}_u"
+            if [ ! -d "$d" ]; then
+              mkdir -p "$d"
+              unzip -q -o "$a" -d "$d" || true
+            fi
+          done
+
+      - name: Find libil2cpp.so and global-metadata.dat
+        run: |
+          SO="$(find x -path '*arm64-v8a*' -name libil2cpp.so | head -n1)"
+          if [ -z "$SO" ]; then SO="$(find x -name libil2cpp.so | head -n1)"; fi
+          META="$(find x -name global-metadata.dat | head -n1)"
+          echo "libil2cpp.so:        $SO"
+          echo "global-metadata.dat: $META"
+          if [ -z "$SO" ] || [ -z "$META" ]; then
+            echo "::error::Не нашёл libil2cpp.so или global-metadata.dat внутри релиза $TAG"
+            exit 1
+          fi
+          echo "SO=$(realpath "$SO")" >> "$GITHUB_ENV"
+          echo "META=$(realpath "$META")" >> "$GITHUB_ENV"
+
+      - name: Download Il2CppDumper
+        run: |
+          ASSETS="$(gh api repos/Perfare/Il2CppDumper/releases/latest --jq '.assets[].browser_download_url')"
+          echo "Доступные сборки:"
+          echo "$ASSETS"
+          # нужна кроссплатформенная сборка (net6 / net8), БЕЗ "win"
+          URL="$(echo "$ASSETS" | grep -i '\.zip$' | grep -i 'net' | grep -vi 'win' | sort -r | head -n1)"
+          if [ -z "$URL" ]; then
+            echo "::error::Не нашёл кроссплатформенную сборку Il2CppDumper"
+            exit 1
+          fi
+          echo "Беру: $URL"
+          curl -fsSL -o dumper.zip "$URL"
+          mkdir -p dumper
+          unzip -q -o dumper.zip -d dumper
+          DLL="$(find dumper -name Il2CppDumper.dll | head -n1)"
+          if [ -z "$DLL" ]; then
+            echo "::error::В архиве нет Il2CppDumper.dll"
+            ls -R dumper
+            exit 1
+          fi
+          echo "DLL=$(realpath "$DLL")" >> "$GITHUB_ENV"
+          CFG="$(dirname "$DLL")/config.json"
+          # чтобы не ждать нажатия клавиши в конце
+          if [ -f "$CFG" ]; then sed -i 's/"RequireAnyKey": *true/"RequireAnyKey": false/' "$CFG"; fi
+
+      - name: Run Il2CppDumper
+        env:
+          DOTNET_ROLL_FORWARD: Major
+        run: |
+          mkdir -p out
+          echo "Заголовок metadata (1-е число всегда 4205910959, 2-е = версия метаданных):"
+          od -An -tu4 -N8 "$META" | tee out/metadata_version.txt
+          dotnet "$DLL" "$SO" "$META" out < /dev/null 2>&1 | tee out/dumper.log
+          ls -la out
+          if [ ! -f out/dump.cs ]; then
+            echo "::error::Il2CppDumper не создал dump.cs, смотри вывод выше"
+            exit 1
+          fi
+
+      - name: Filter interesting classes
+        run: |
+          grep -n -i -E 'paper|plane|glider|airplane' out/dump.cs > out/plane_hits.txt || true
+          grep -n -i -E '^\s*(public|internal)?.*class .*(player|camera|vehicle|input|plane|paper|network|mirror|photon|netcode|lobby|multiplayer|discovery|transport)' out/dump.cs > out/classes_hits.txt || true
+          {
+            echo "## Совпадения: paper / plane / glider"
+            echo '```'
+            head -n 200 out/plane_hits.txt
+            echo '```'
+            echo "## Классы: player / camera / vehicle / input / network"
+            echo '```'
+            head -n 200 out/classes_hits.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Find player / movement classes (for cheats mod)
+        run: |
+          # 1) короткий список: имена классов про игрока и движение
+          grep -n -i -E '^[[:space:]]*(public|internal|private|protected)?[[:space:]]*(sealed |static |abstract )*(class|struct) [A-Za-z0-9_<>]*(player|movement|character|bear|fly|speed|jump|walk|run)' out/dump.cs \
+            | sed 's/ \/\/ TypeDefIndex.*//' > out/class-list.txt || true
+
+          # 2) полный текст (поля + методы) самых вероятных классов
+          awk -v pat='player|movement|character|bear' '
+            /^[ \t]*(public|internal|private|protected)?[ \t]*(sealed |static |abstract )*(class|struct) / {
+              name=$0; sub(/ *\/\/ TypeDefIndex.*/,"",name)
+              show = (tolower(name) ~ pat)
+              if (show && prev != "") print prev
+            }
+            show {print}
+            /^}/ {show=0}
+            {prev=$0}
+          ' out/dump.cs > out/player-classes.txt || true
+
+          {
+            echo "## ИГРОК: имена классов"
+            echo '```'
+            head -n 150 out/class-list.txt
+            echo '```'
+            echo "## ИГРОК: полный текст классов"
+            echo '```'
+            head -c 200000 out/player-classes.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          wc -l out/class-list.txt out/player-classes.txt
+
+      - name: Upload dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: il2cpp-dump
+          path: |
+            out/dump.cs
+            out/plane_hits.txt
+            out/classes_hits.txt
+            out/class-list.txt
+            out/player-classes.txt
+            out/script.json
+            out/dumper.log
+            out/metadata_version.txt
+          if-no-files-found: warn
+          retention-days: 14
