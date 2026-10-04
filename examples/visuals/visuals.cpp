@@ -1,9 +1,6 @@
-// visuals.cpp: "Visual Styles" mod for Super Bear Adventure (v0.6).
+// visuals.cpp: "Visual Styles" mod for Super Bear Adventure (v0.7).
 //
-// v0.5/v0.6 add ad removal (settings "no_ads" and "skip_rewarded", both on by default):
-//  - full-screen ads between levels are not shown,
-//  - ads you start for a reward are skipped and the reward is given at once.
-// Purchases and the premium checks are not touched. Details: see "no ads" below.
+// v0.7: ad removal moved to its own mod ("No Ads", examples/no-ads); colours are softer.
 //
 // The game's shaders ignore Unity lighting, so changing lights only recolours
 // the sky. This mod therefore:
@@ -236,10 +233,10 @@ struct Style {
 // Index = value of the "style" setting. 0 = the game as it was.
 static const Style kStyles[4] = {
     {"day (original)", {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, 0.0f, {1, 1, 1}, 0.0f, false, {}},
-    {"sunset", {1.12f, 0.76f, 0.56f}, {1.25f, 0.70f, 0.60f}, {1.0f, 0.6f, 0.4f}, 0.0f,
-     {1.0f, 0.55f, 0.32f}, 0.004f, true, {16, -35, 0}},
-    {"night", {0.30f, 0.40f, 0.80f}, {0.20f, 0.26f, 0.65f}, {0.1f, 0.15f, 0.4f}, 0.0f,
-     {0.04f, 0.06f, 0.18f}, 0.010f, true, {60, -30, 0}},
+    {"sunset", {1.0f, 0.85f, 0.70f}, {1.0f, 0.75f, 0.66f}, {1.0f, 0.6f, 0.4f}, 0.0f,
+     {1.0f, 0.55f, 0.32f}, 0.003f, true, {16, -35, 0}},
+    {"night", {0.50f, 0.58f, 0.88f}, {0.25f, 0.32f, 0.70f}, {0.1f, 0.15f, 0.4f}, 0.0f,
+     {0.04f, 0.06f, 0.18f}, 0.006f, true, {60, -30, 0}},
     {"pastel", {1.02f, 1.0f, 1.08f}, {1.1f, 1.1f, 1.3f}, {0.96f, 0.91f, 1.0f}, 0.30f,
      {0.85f, 0.90f, 1.0f}, 0.006f, false, {}},
 };
@@ -255,8 +252,6 @@ struct Config {
   int style = 0;
   float strength = 1;
   bool shadows = true;
-  bool no_ads = true;        // not part of operator==: they do not need a visual re-apply
-  bool skip_rewarded = true;
   bool operator==(const Config& o) const {
     return enabled == o.enabled && style == o.style && shadows == o.shadows &&
            std::fabs(strength - o.strength) < 0.001f;
@@ -380,8 +375,6 @@ static Config read_config() {
   if (get_setting_num(file, "style", v)) c.style = static_cast<int>(v);
   if (get_setting_num(file, "strength", v)) c.strength = static_cast<float>(v);
   if (get_setting_num(file, "shadows", v)) c.shadows = v != 0;
-  if (get_setting_num(file, "no_ads", v)) c.no_ads = v != 0;
-  if (get_setting_num(file, "skip_rewarded", v)) c.skip_rewarded = v != 0;
   c.style = std::min(3, std::max(0, c.style));
   c.strength = std::min(1.0f, std::max(0.0f, c.strength));
   return c;
@@ -594,8 +587,10 @@ static void apply_fog(const Style* st, float t) {
   }
 }
 
+// A colour that was already in 0..1 stays in 0..1 (no blown-out neon yellow); HDR values are left alone.
 static float tint(float o, float mul, float mc, float mix, float t) {
-  return lerpf(o, o * mul * (1 - mix) + mc * mix, t);
+  float r = lerpf(o, o * mul * (1 - mix) + mc * mix, t);
+  return o <= 1.0f ? std::min(1.0f, std::max(0.0f, r)) : r;
 }
 
 // st = nullptr or t = 0 puts the original look back.
@@ -1004,115 +999,7 @@ static void apply_config() {
   apply_glow();
 }
 
-// ---- no ads
-// The game shows ads in exactly two places (found by reading its code):
-//  1. full-screen ads between levels: AdsManager.TryDisplayInterstitial asks
-//     AdsManager.IsInterstitialReady() first. Answering "no" sends the game down its normal
-//     "no ad available" path, so nothing is shown and nothing gets stuck.
-//  2. ads you start for a reward (revive, double coins...): AdsManager.ShowRewardedAd checks the
-//     rules, remembers the reward and later calls AdsManager.ShowRewardedAdSdk, which opens the
-//     ad. The mod lets all of that run, but where the ad would open it calls the game's own
-//     "ad was watched" function (AdsManager.OnRewardedAdComplete) instead. IsRewardedReady()
-//     answers "yes", so the button never waits for an ad to load.
-// Purchases and the premium checks are not touched.
-static bool g_no_ads = true;         // setting "no_ads"
-static bool g_skip_rewarded = true;  // setting "skip_rewarded"
-static float g_t_noads = 10;
-static float g_ad_clock = 0;
-static int g_ads_blocked = 0;
-
-static bool (*o_int_ready)(const void*) = nullptr;
-static bool (*o_rew_ready)(const void*) = nullptr;
-static void (*o_show_rewarded)(void*, int, const void*) = nullptr;
-static void (*o_show_rewarded_sdk)(void*, const void*) = nullptr;
-
-static void* g_ad_self = nullptr;  // the AdsManager that is waiting to "finish" a rewarded ad
-static float g_ad_self_time = 0;
-static void* m_ad_complete = nullptr;
-static bool g_ad_resolve_failed = false;
-
-static void note_blocked(const char* what) {
-  ++g_ads_blocked;
-  if (g_ads_blocked <= 3 || g_ads_blocked % 200 == 0)
-    say(BEARITE_LOG_INFO, "no-ads: %s (%d times)", what, g_ads_blocked);
-}
-
-// Static methods get only the MethodInfo* argument.
-static bool hk_int_ready(const void* mi) {
-  if (g_no_ads) { note_blocked("IsInterstitialReady -> not ready"); return false; }
-  return o_int_ready ? o_int_ready(mi) : false;
-}
-
-static bool hk_rew_ready(const void* mi) {
-  if (g_skip_rewarded) return true;
-  return o_rew_ready ? o_rew_ready(mi) : false;
-}
-
-// Instance methods get `this` first. The game itself passes a null MethodInfo to these.
-static void hk_show_rewarded(void* self, int reward, const void* mi) {
-  if (g_skip_rewarded && self) {
-    g_ad_self = self;
-    g_ad_self_time = g_ad_clock;
-  }
-  if (o_show_rewarded) o_show_rewarded(self, reward, mi);
-}
-
-// `this` is NOT reliable here: when the game opens the ad straight away it does not pass it
-// (the original does not use it), so the instance saved in hk_show_rewarded is used.
-static void hk_show_rewarded_sdk(void* self, const void* mi) {
-  if (g_skip_rewarded && g_ad_self && g_ad_clock - g_ad_self_time < 20.0f && !g_ad_resolve_failed) {
-    if (!m_ad_complete && il::init()) {
-      void* klass = il::find_class("Assembly-CSharp", "", "AdsManager");
-      m_ad_complete = il::find_method(klass, "OnRewardedAdComplete", 0);
-      if (!m_ad_complete) {
-        g_ad_resolve_failed = true;
-        say(BEARITE_LOG_WARN, "no-ads: AdsManager.OnRewardedAdComplete not found, rewarded ads stay as they are");
-      }
-    }
-    if (m_ad_complete) {
-      void* inst = g_ad_self;
-      g_ad_self = nullptr;  // one reward per request
-      il::call(m_ad_complete, inst);
-      if (!il::g_exc) {
-        note_blocked("rewarded ad skipped, reward given");
-        return;
-      }
-      say(BEARITE_LOG_WARN, "no-ads: OnRewardedAdComplete threw an exception, showing the real ad");
-    }
-  }
-  if (o_show_rewarded_sdk) o_show_rewarded_sdk(self, mi);
-}
-
-static void install_no_ads() {
-  const char* game = "Assembly-CSharp";
-  bool a = bearite::hook(game, "", "AdsManager", "IsInterstitialReady", 0,
-                         reinterpret_cast<void*>(&hk_int_ready), reinterpret_cast<void**>(&o_int_ready));
-  bool b = bearite::hook(game, "", "AdsManager", "IsRewardedReady", 0,
-                         reinterpret_cast<void*>(&hk_rew_ready), reinterpret_cast<void**>(&o_rew_ready));
-  bool c = bearite::hook(game, "", "AdsManager", "ShowRewardedAd", 1,
-                         reinterpret_cast<void*>(&hk_show_rewarded), reinterpret_cast<void**>(&o_show_rewarded));
-  bool d = bearite::hook(game, "", "AdsManager", "ShowRewardedAdSdk", 0,
-                         reinterpret_cast<void*>(&hk_show_rewarded_sdk),
-                         reinterpret_cast<void**>(&o_show_rewarded_sdk));
-  say(BEARITE_LOG_INFO,
-      "no-ads: hooks queued IsInterstitialReady=%d IsRewardedReady=%d ShowRewardedAd=%d ShowRewardedAdSdk=%d",
-      a, b, c, d);
-}
-
 static void update(float dt) {
-  // The ad switches are read on their own, so they work even if the visual part is not running.
-  g_ad_clock += dt;
-  g_t_noads += dt;
-  if (g_t_noads >= 1.0f) {
-    g_t_noads = 0;
-    Config c = read_config();
-    if (c.no_ads != g_no_ads) say(BEARITE_LOG_INFO, "no-ads: between-level ads %s", c.no_ads ? "blocked" : "allowed");
-    if (c.skip_rewarded != g_skip_rewarded)
-      say(BEARITE_LOG_INFO, "no-ads: rewarded ads %s", c.skip_rewarded ? "skipped" : "shown");
-    g_no_ads = c.no_ads;
-    g_skip_rewarded = c.skip_rewarded;
-  }
-
   if (g_dead) return;
   if (!g_ready) {
     g_t_retry += dt;
@@ -1167,8 +1054,6 @@ static void update(float dt) {
 }
 
 static void unload() {
-  g_no_ads = false;  // the loader removes the hooks; until then they just pass through
-  g_skip_rewarded = false;
   if (!g_ready) return;
   if (g_touched) apply(nullptr, 0);
   g_cfg.shadows = false;
@@ -1186,8 +1071,7 @@ extern "C" {
 BEARITE_EXPORT int bearite_on_load(const BeariteApi* api) {
   bearite::init(api);
   if (api && api->mod_dir) vis::g_dir = api->mod_dir;
-  say(BEARITE_LOG_INFO, "Visual Styles 0.6 loaded, mod dir: %s", vis::g_dir.c_str());
-  vis::install_no_ads();
+  say(BEARITE_LOG_INFO, "Visual Styles 0.7 loaded, mod dir: %s", vis::g_dir.c_str());
   return 0;
 }
 

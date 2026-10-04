@@ -1,15 +1,13 @@
 {
   "id": "visuals",
   "name": "Visual Styles",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "author": "spikle",
   "library": "libvisuals.so",
   "settings": [
     { "key": "enabled", "label": "Включено", "type": "bool", "default": true },
     { "key": "style", "label": "Стиль: 0 день, 1 закат, 2 ночь, 3 пастель", "type": "int", "default": 0, "min": 0, "max": 3 },
     { "key": "strength", "label": "Сила эффекта", "type": "float", "default": 1.0, "min": 0.0, "max": 1.0 },
-    { "key": "shadows", "label": "Тени от игрока", "type": "bool", "default": true },
-    { "key": "no_ads", "label": "Без рекламы между уровнями", "type": "bool", "default": true },
-    { "key": "skip_rewarded", "label": "Награды без просмотра рекламы", "type": "bool", "default": true }
+    { "key": "shadows", "label": "Тени от игрока", "type": "bool", "default": true }
   ]
 }
