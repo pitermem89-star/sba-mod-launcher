@@ -1,0 +1,71 @@
+name: Find player class
+
+# Manual run: Actions -> "Find player class" -> Run workflow.
+# It searches dump.cs for the player / movement classes and shows the result
+# right on the run page (open the run and scroll to "Summary").
+on:
+  workflow_dispatch:
+
+jobs:
+  find:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Search dump.cs
+        run: |
+          set -u
+          DUMP=$(find . -type f -iname 'dump.cs' -not -path './.git/*' | head -n1)
+          if [ -z "$DUMP" ]; then
+            {
+              echo "## dump.cs NOT FOUND in the repository"
+              echo "Upload dump.cs to the repo (any folder) and run again."
+              echo
+              echo "Files named like dump:"
+              find . -type f -iname '*dump*' -not -path './.git/*' | head -n 20
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "found: $DUMP ($(wc -c < "$DUMP") bytes)"
+
+          mkdir -p out
+
+          # 1) short list: every class whose name looks interesting
+          grep -n -i -E '^[[:space:]]*(public|internal|private|protected)?[[:space:]]*(sealed |static |abstract )*(class|struct) [A-Za-z0-9_<>]*(player|movement|character|bear|controller|fly|speed|noclip|jump|walk|run)' "$DUMP" \
+            | sed 's/ \/\/ TypeDefIndex.*//' > out/class-list.txt || true
+
+          # 2) full text (fields + methods) of the most likely classes
+          awk -v pat='player|movement|character|bear' '
+            /^[ \t]*(public|internal|private|protected)?[ \t]*(sealed |static |abstract )*(class|struct) / {
+              name=$0; sub(/ *\/\/ TypeDefIndex.*/,"",name)
+              show = (tolower(name) ~ pat)
+              if (show && prev != "") print prev
+            }
+            show {print}
+            /^}/ {show=0}
+            {prev=$0}
+          ' "$DUMP" > out/player-classes.txt || true
+
+          {
+            echo "## dump.cs: $DUMP"
+            echo
+            echo "### 1) Class names that look interesting"
+            echo '```'
+            head -n 150 out/class-list.txt
+            echo '```'
+            echo
+            echo "### 2) Full text of player / movement / character / bear classes"
+            echo '```'
+            head -c 200000 out/player-classes.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          wc -l out/class-list.txt out/player-classes.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-class-search
+          path: out/
+          if-no-files-found: ignore
