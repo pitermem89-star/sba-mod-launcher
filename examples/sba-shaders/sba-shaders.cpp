@@ -160,7 +160,7 @@ void capture_originals() {
   saved.have = true;
 }
 
-void apply(const std::string& style, float t) {
+void apply_style(const std::string& style, float t) {
   Preset p;
   bool is_style = get_preset(style, p);
   void* sun = sun_light();
@@ -208,7 +208,7 @@ void tick() {
   std::string key = style + "|" + std::to_string(t);
   if (key == g_last_key) return;
   g_last_key = key;
-  apply(style, t);
+  apply_style(style, t);
   bearite::log(BEARITE_LOG_INFO, TAG, "style=%s strength=%.1f", style.c_str(), t);
 }
 
