@@ -13,11 +13,13 @@
 //      closes it.
 //   3. Mods that declare "settings" in their mod.json get a "Настроить" button;
 //      the values are stored in <mod dir>/settings.json (see settings.inc).
-//   4. IL2CPP calls (Instantiate, SetActive, set_text, ...) go through
+//   4. Ad removal (settings no_ads / skip_rewarded): see "no ads" below.
+//   5. IL2CPP calls (Instantiate, SetActive, set_text, ...) go through
 //      il2cpp_runtime_invoke, resolved from libil2cpp.so with dlsym.
 #include "bearite.hpp"
 
 #include <dirent.h>
+#include <time.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
 
@@ -1420,6 +1422,135 @@ void build(void* pause_menu) {
   }
 }
 
+// ------------------------------------------------------------ no ads -------
+// The game shows ads in exactly two places (found by reading its code):
+//  1. full-screen ads between levels: AdsManager.TryDisplayInterstitial asks
+//     AdsManager.IsInterstitialReady() first. Answering "no" sends the game down its normal
+//     "no ad available" path, so nothing is shown and nothing gets stuck.
+//  2. ads you start for a reward (revive, double coins...): AdsManager.ShowRewardedAd checks the
+//     rules, remembers the reward and later calls AdsManager.ShowRewardedAdSdk, which opens the
+//     ad. Where the ad would open we call the game's own "ad was watched" function
+//     (AdsManager.OnRewardedAdComplete) instead. IsRewardedReady() answers "yes", so the button
+//     never waits for an ad to load.
+// Purchases and the premium checks are not touched.
+// Settings (this mod's menu): no_ads, skip_rewarded, both on by default. They are read from
+// settings.json at most once a second, from inside the hooks.
+
+double now_sec() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+}
+
+bool ad_flag(const std::string& text, const char* key, bool def) {
+  std::string pat = std::string("\"") + key + "\"";
+  size_t p = text.find(pat);
+  if (p == std::string::npos) return def;
+  p = text.find(':', p + pat.size());
+  if (p == std::string::npos) return def;
+  ++p;
+  while (p < text.size() && (text[p] == ' ' || text[p] == '\n' || text[p] == '\r' || text[p] == '\t')) ++p;
+  if (text.compare(p, 4, "true") == 0 || (p < text.size() && text[p] == '1')) return true;
+  if (text.compare(p, 5, "false") == 0 || (p < text.size() && text[p] == '0')) return false;
+  return def;
+}
+
+bool g_no_ads = true, g_skip_rewarded = true;
+double g_ads_checked = -100;
+int g_ads_blocked = 0;
+
+void ads_refresh() {
+  double t = now_sec();
+  if (t - g_ads_checked < 1.0) return;
+  g_ads_checked = t;
+  const BeariteApi* a = bearite::api();
+  if (!a || !a->mod_dir) return;
+  std::string text = read_file(std::string(a->mod_dir) + "/settings.json");
+  bool n = ad_flag(text, "no_ads", true), r = ad_flag(text, "skip_rewarded", true);
+  if (n != g_no_ads) bearite::log(BEARITE_LOG_INFO, TAG, "between-level ads %s", n ? "blocked" : "allowed");
+  if (r != g_skip_rewarded) bearite::log(BEARITE_LOG_INFO, TAG, "rewarded ads %s", r ? "skipped" : "shown");
+  g_no_ads = n;
+  g_skip_rewarded = r;
+}
+
+void ad_note(const char* what) {
+  ++g_ads_blocked;
+  if (g_ads_blocked <= 3 || g_ads_blocked % 200 == 0)
+    bearite::log(BEARITE_LOG_INFO, TAG, "no-ads: %s (%d times)", what, g_ads_blocked);
+}
+
+bool (*orig_int_ready)(const void*) = nullptr;
+bool (*orig_rew_ready)(const void*) = nullptr;
+void (*orig_show_rewarded)(void*, int, const void*) = nullptr;
+void (*orig_show_rewarded_sdk)(void*, const void*) = nullptr;
+
+void* g_ad_self = nullptr;  // the AdsManager that is waiting to "finish" a rewarded ad
+double g_ad_self_time = 0;
+void* m_ad_complete = nullptr;
+bool g_ad_resolve_failed = false;
+
+// Static methods get only the MethodInfo* argument.
+bool hk_int_ready(const void* mi) {
+  ads_refresh();
+  if (g_no_ads) { ad_note("IsInterstitialReady -> not ready"); return false; }
+  return orig_int_ready ? orig_int_ready(mi) : false;
+}
+
+bool hk_rew_ready(const void* mi) {
+  ads_refresh();
+  if (g_skip_rewarded) return true;
+  return orig_rew_ready ? orig_rew_ready(mi) : false;
+}
+
+// Instance methods get `this` first. The game itself passes a null MethodInfo to these.
+void hk_show_rewarded(void* self, int reward, const void* mi) {
+  ads_refresh();
+  if (g_skip_rewarded && self) {
+    g_ad_self = self;
+    g_ad_self_time = now_sec();
+  }
+  if (orig_show_rewarded) orig_show_rewarded(self, reward, mi);
+}
+
+// `this` is NOT reliable here: when the game opens the ad straight away it does not pass it
+// (the original does not use it), so the instance saved in hk_show_rewarded is used.
+void hk_show_rewarded_sdk(void* self, const void* mi) {
+  ads_refresh();
+  if (g_skip_rewarded && g_ad_self && now_sec() - g_ad_self_time < 20.0 && !g_ad_resolve_failed) {
+    if (!m_ad_complete && load_il2cpp()) {
+      m_ad_complete = find_method(find_class(ASM_GAME, "", "AdsManager"), "OnRewardedAdComplete", {});
+      if (!m_ad_complete) {
+        g_ad_resolve_failed = true;
+        bearite::log(BEARITE_LOG_WARN, TAG, "no-ads: OnRewardedAdComplete not found, rewarded ads stay as they are");
+      }
+    }
+    if (m_ad_complete) {
+      void* inst = g_ad_self;
+      g_ad_self = nullptr;  // one reward per request
+      bool ok = false;
+      call(m_ad_complete, inst, {}, &ok);
+      if (ok) { ad_note("rewarded ad skipped, reward given"); return; }
+      bearite::log(BEARITE_LOG_WARN, TAG, "no-ads: OnRewardedAdComplete threw an exception, showing the real ad");
+    }
+  }
+  if (orig_show_rewarded_sdk) orig_show_rewarded_sdk(self, mi);
+}
+
+void install_no_ads() {
+  bool a = bearite::hook(ASM_GAME, "", "AdsManager", "IsInterstitialReady", 0,
+                         reinterpret_cast<void*>(&hk_int_ready), reinterpret_cast<void**>(&orig_int_ready));
+  bool b = bearite::hook(ASM_GAME, "", "AdsManager", "IsRewardedReady", 0,
+                         reinterpret_cast<void*>(&hk_rew_ready), reinterpret_cast<void**>(&orig_rew_ready));
+  bool c = bearite::hook(ASM_GAME, "", "AdsManager", "ShowRewardedAd", 1,
+                         reinterpret_cast<void*>(&hk_show_rewarded), reinterpret_cast<void**>(&orig_show_rewarded));
+  bool d = bearite::hook(ASM_GAME, "", "AdsManager", "ShowRewardedAdSdk", 0,
+                         reinterpret_cast<void*>(&hk_show_rewarded_sdk),
+                         reinterpret_cast<void**>(&orig_show_rewarded_sdk));
+  bearite::log(BEARITE_LOG_INFO, TAG,
+               "no-ads: hooks queued IsInterstitialReady=%d IsRewardedReady=%d ShowRewardedAd=%d ShowRewardedAdSdk=%d",
+               a, b, c, d);
+}
+
       // window contents, building the menu, actions
 // -------------------------------------------------------------- hooks ------
 
@@ -1483,10 +1614,11 @@ BEARITE_EXPORT int bearite_on_load(const BeariteApi* api) {
                          reinterpret_cast<void*>(&hk_click), reinterpret_cast<void**>(&orig_click));
   bool c = bearite::hook(ASM_UI, "UnityEngine.UI", "Button", "OnSubmit", 1,
                          reinterpret_cast<void*>(&hk_submit), reinterpret_cast<void**>(&orig_submit));
-  bearite::log(BEARITE_LOG_INFO, TAG, "BUILD 6 loaded, hooks: Start=%d OnPointerClick=%d OnSubmit=%d", a, b, c);
+  install_no_ads();  // ad removal; a failure here never stops the menu
+  bearite::log(BEARITE_LOG_INFO, TAG, "BUILD 7 loaded, hooks: Start=%d OnPointerClick=%d OnSubmit=%d", a, b, c);
   return (a && b && c) ? 0 : 1;
 }
 
-BEARITE_EXPORT void bearite_on_unload(void) { g.btn = nullptr; for (auto& o : g_other) o.btn = nullptr; }
+BEARITE_EXPORT void bearite_on_unload(void) { g_no_ads = false; g_skip_rewarded = false; g_ads_checked = 1e18; g.btn = nullptr; for (auto& o : g_other) o.btn = nullptr; }
 
 }  // extern "C"

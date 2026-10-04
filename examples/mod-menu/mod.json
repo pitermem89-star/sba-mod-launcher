@@ -1,13 +1,15 @@
 {
   "id": "mod-menu",
   "name": "Bearite",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "spikle",
   "library": "libmod-menu.so",
   "settings": [
     { "key": "enabled", "label": "Включено", "type": "bool", "default": true },
     { "key": "scale", "label": "Масштаб", "type": "float",
       "min": 0.5, "max": 2, "step": 0.1, "default": 1 },
+    { "key": "no_ads", "label": "Без рекламы между уровнями", "type": "bool", "default": true },
+    { "key": "skip_rewarded", "label": "Награды без просмотра рекламы", "type": "bool", "default": true },
     { "key": "greeting", "label": "Приветствие", "type": "choice",
       "choices": ["hello", "hi", "привет"], "default": "hello" }
   ]
