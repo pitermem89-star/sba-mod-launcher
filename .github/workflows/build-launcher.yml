@@ -45,7 +45,16 @@ jobs:
           fi
 
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+        run: |
+          set +e
+          gradle assembleDebug --no-daemon --console=plain > build.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            # show the real errors as annotations (readable without downloading logs)
+            grep -E "^e: |error:|What went wrong|Execution failed|Could not|FAILED" build.log | head -15 | while IFS= read -r l; do echo "::error::$l"; done
+            tail -20 build.log
+          fi
+          exit $rc
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
