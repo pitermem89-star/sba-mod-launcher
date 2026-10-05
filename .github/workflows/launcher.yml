@@ -14,11 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Распаковать проект
-        run: |
-          rm -rf launcher
-          unzip -q launcher.zip
-
       - name: Найти libbearite.so и вшить в лаунчер
         run: |
           DEST=launcher/app/src/main/assets/libbearite.so
