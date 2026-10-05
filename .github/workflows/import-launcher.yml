@@ -1,0 +1,45 @@
+name: Import launcher source
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag with launcher.zip"
+        default: "launcher-src"
+      asset:
+        description: "Asset name pattern"
+        default: "launcher.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download launcher.zip from Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ASSET: ${{ inputs.asset }}
+        run: |
+          mkdir -p _import
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir _import --clobber
+
+      - name: Extract into repo root
+        run: |
+          # The zip contains a single top-level "launcher/" folder.
+          # Remove the old copy first so deleted files don't linger.
+          rm -rf launcher
+          unzip -q "_import/$(ls _import)" -d .
+          rm -rf _import
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add launcher
+          git commit -m "Import launcher source from Release" || echo "Nothing to commit"
+          git push

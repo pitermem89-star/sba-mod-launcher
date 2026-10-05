@@ -1,0 +1,52 @@
+name: Build launcher
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "launcher/**"
+      - ".github/workflows/build-launcher.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: launcher
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Check keystore is present
+        run: |
+          if [ ! -f app/src/main/assets/debug.keystore ]; then
+            echo "::error::app/src/main/assets/debug.keystore is missing. Run the 'Generate debug keystore' workflow once first."
+            exit 1
+          fi
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bearite-launcher
+          path: launcher/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
