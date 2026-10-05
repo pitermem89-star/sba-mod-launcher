@@ -10,18 +10,26 @@ import java.util.zip.CRC32
 
 object PairipPatch {
 
-    const val CLIENT = "Lcom/pairip/licensecheck/LicenseClient;"
+    private const val PREFIX = "Lcom/pairip/"
+    private const val CLIENT_HINT = "Lcom/pairip/licensecheck/LicenseClient;"
 
-    val TARGETS = setOf(
-        "initializeLicenseCheck",
-        "checkLicense",
-        "checkLicenseInternal",
-        "bindToLicensingService",
-        "handleError",
-        "startErrorDialogActivity",
-        "startPaywallActivity",
-        "scheduleAppShutdown",
-        "scheduleRepeatedLicenseCheck"
+    // Exact names seen in builds up to 13.0.5. Checked first so a clean match
+    // is still reported precisely even though the scan below would find it too.
+    private val KNOWN_NAMES = setOf(
+        "initializeLicenseCheck", "checkLicense", "checkLicenseInternal",
+        "bindToLicensingService", "handleError", "startErrorDialogActivity",
+        "startPaywallActivity", "scheduleAppShutdown", "scheduleRepeatedLicenseCheck"
+    )
+
+    // A void, no-arg method under com/pairip/ that calls one of these is almost
+    // certainly part of the shutdown/paywall path, whatever it ends up named.
+    private val KILL_CALLS = setOf(
+        "Ljava/lang/System;->exit",
+        "Ljava/lang/Runtime;->exit",
+        "Landroid/os/Process;->killProcess",
+        "Landroid/app/Activity;->finish",
+        "Landroid/app/Activity;->finishAffinity",
+        "Landroid/content/Context;->bindService"
     )
 
     private fun le(b: ByteArray): ByteBuffer = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
@@ -111,13 +119,41 @@ object PairipPatch {
         return count
     }
 
+    // Read-only variant for a "Diagnose game" button: same detection, no writes.
+    fun scan(dex: ByteArray): String {
+        val reader = DexReader(dex)
+        val hits = findHits(reader)
+        val sb = StringBuilder("PairIP: ${hits.size} method(s) detected\n")
+        for ((key, reason) in hits) sb.append("  - $key ($reason)\n")
+        if (hits.isEmpty()) sb.append("  Ничего не найдено — защита не распознана этим сканером.\n")
+        return sb.toString()
+    }
+
+    private fun findHits(reader: DexReader): LinkedHashMap<String, String> {
+        val hits = LinkedHashMap<String, String>()
+        for (m in reader.methods(CLIENT_HINT)) {
+            if (m.name in KNOWN_NAMES && m.shorty == "V" && m.codeOff != 0) {
+                hits["${m.cls}->${m.name}"] = "known name"
+            }
+        }
+        for (m in reader.methodsByPrefix(PREFIX)) {
+            val key = "${m.cls}->${m.name}"
+            if (key in hits || m.shorty != "V" || m.codeOff == 0) continue
+            val call = reader.invokedSignatures(m).firstOrNull { sig -> KILL_CALLS.any { sig.startsWith(it) } }
+            if (call != null) hits[key] = "calls $call"
+        }
+        return hits
+    }
+
     private fun neuter(dex: ByteArray): Int {
         val reader = DexReader(dex)
+        val hits = findHits(reader)
         var count = 0
-        for (m in reader.methods(CLIENT)) {
-            if (m.name !in TARGETS) continue
-            if (!m.shorty.startsWith("V")) continue
-            if (m.codeOff == 0 || m.insnsSize < 1) continue
+        for (key in hits.keys) {
+            val (cls, name) = key.split("->", limit = 2)
+            val m = (reader.methods(cls) + reader.methodsByPrefix(PREFIX))
+                .firstOrNull { it.cls == cls && it.name == name && it.shorty == "V" }
+            if (m == null || m.codeOff == 0 || m.insnsSize < 1) continue
             val start = m.codeOff + 16
             val bytes = m.insnsSize * 2
             dex[start] = 0x0e.toByte()      // return-void
