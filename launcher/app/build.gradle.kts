@@ -25,6 +25,7 @@ android {
 }
 
 dependencies {
+    implementation("com.google.android.material:material:1.12.0")
     implementation("com.android.tools.build:apksig:8.5.2")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 }

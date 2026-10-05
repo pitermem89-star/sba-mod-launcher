@@ -1,6 +1,5 @@
 package dev.bearite.launcher
 
-import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -10,16 +9,28 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ScrollView
+import android.view.View
 import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.progressindicator.LinearProgressIndicator
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity() {
 
     private lateinit var status: TextView
     private lateinit var patcher: Patcher
+    private lateinit var progress: LinearProgressIndicator
+    private lateinit var buttons: List<MaterialButton>
+
+    // While something runs: show the progress bar and block the buttons.
     private var busy = false
+        set(value) {
+            field = value
+            if (::progress.isInitialized) {
+                progress.visibility = if (value) View.VISIBLE else View.INVISIBLE
+                buttons.forEach { it.isEnabled = !value }
+            }
+        }
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
@@ -41,34 +52,17 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         patcher = Patcher(this) { m -> runOnUiThread { status.append(m + "\n") } }
 
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setPadding(40, 80, 40, 40)
-
-        val patchButton = Button(this)
-        patchButton.text = "Patch and install game"
+        setContentView(R.layout.activity_main)
+        progress = findViewById(R.id.progress)
+        status = findViewById(R.id.status)
+        status.text = ""
+        val patchButton = findViewById<MaterialButton>(R.id.btn_patch)
+        val installButton = findViewById<MaterialButton>(R.id.btn_install)
+        val diagButton = findViewById<MaterialButton>(R.id.btn_diag)
+        buttons = listOf(patchButton, installButton, diagButton)
         patchButton.setOnClickListener { startPatch() }
-
-        val installButton = Button(this)
-        installButton.text = "Install already prepared files"
         installButton.setOnClickListener { installPrepared() }
-
-        val diagButton = Button(this)
-        diagButton.text = "Diagnose game"
         diagButton.setOnClickListener { startDiag() }
-
-        status = TextView(this)
-        status.textSize = 13f
-        status.setTextIsSelectable(true)
-        status.text = "WARNING: the original game will be uninstalled, local game data is lost.\n\n"
-
-        root.addView(patchButton)
-        root.addView(installButton)
-        root.addView(diagButton)
-        val scroll = ScrollView(this)
-        scroll.addView(status)
-        root.addView(scroll)
-        setContentView(root)
 
         val filter = IntentFilter(Patcher.ACTION_INSTALL_RESULT)
         if (Build.VERSION.SDK_INT >= 33) {

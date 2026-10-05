@@ -7,7 +7,11 @@
         <package android:name="com.Earthkwak.Platformer" />
     </queries>
 
-    <application android:label="Bearite Launcher">
+    <application
+        android:name=".App"
+        android:label="Bearite Launcher"
+        android:largeHeap="true"
+        android:theme="@style/Theme.Bearite">
         <activity
             android:name=".MainActivity"
             android:exported="true"

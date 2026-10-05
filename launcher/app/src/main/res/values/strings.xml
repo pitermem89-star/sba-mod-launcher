@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Bearite Launcher</string>
+    <string name="app_subtitle">Super Bear Adventure</string>
+    <string name="warning">The original game will be uninstalled and its local data is lost.</string>
+    <string name="patch_and_install">Patch and install game</string>
+    <string name="install_prepared">Install already prepared files</string>
+    <string name="diagnose">Diagnose game</string>
+    <string name="log_title">Log</string>
+    <string name="log_empty">Nothing here yet.</string>
+</resources>

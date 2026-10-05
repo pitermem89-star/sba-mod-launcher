@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="md_primary">#FFB867</color>
+    <color name="md_on_primary">#4A2800</color>
+    <color name="md_primary_container">#693C00</color>
+    <color name="md_on_primary_container">#FFDDB8</color>
+    <color name="md_secondary">#E1C1A4</color>
+    <color name="md_on_secondary">#402C17</color>
+    <color name="md_secondary_container">#58422C</color>
+    <color name="md_on_secondary_container">#FEDDBF</color>
+    <color name="md_tertiary">#C1CB98</color>
+    <color name="md_on_tertiary">#2B3408</color>
+    <color name="md_tertiary_container">#414B1D</color>
+    <color name="md_on_tertiary_container">#DDE7B2</color>
+    <color name="md_error">#FFB4AB</color>
+    <color name="md_on_error">#690005</color>
+    <color name="md_error_container">#93000A</color>
+    <color name="md_on_error_container">#FFDAD6</color>
+    <color name="md_surface">#17120D</color>
+    <color name="md_on_surface">#ECE0D7</color>
+    <color name="md_surface_variant">#51443A</color>
+    <color name="md_on_surface_variant">#D5C3B6</color>
+    <color name="md_outline">#9E8E81</color>
+    <color name="md_outline_variant">#51443A</color>
+    <color name="md_container_lowest">#120D08</color>
+    <color name="md_container_low">#201B16</color>
+    <color name="md_container">#241F1A</color>
+    <color name="md_container_high">#2F2924</color>
+    <color name="md_container_highest">#3A342E</color>
+</resources>
