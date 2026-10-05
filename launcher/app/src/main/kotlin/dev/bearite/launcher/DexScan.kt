@@ -141,19 +141,21 @@ class DexReader(private val data: ByteArray) {
 }
 
 object PairipScan {
-    fun run(ctx: Context): String = try {
-        val info = ctx.packageManager.getPackageInfo(Patcher.GAME, 0)
-        val app = info.applicationInfo ?: return "Ошибка: данные игры не найдены."
-        val zip = ZipFile(File(app.sourceDir))
-        try {
-            val entry = zip.getEntry("classes.dex") ?: return "classes.dex не найден в APK."
-            val bytes = zip.getInputStream(entry).use { it.readBytes() }
-            "Оригинальный classes.dex: ${bytes.size / 1024} KB\n\n" + PairipPatch.scan(bytes)
-        } finally {
-            zip.close()
+    fun run(ctx: Context): String {
+        return try {
+            val info = ctx.packageManager.getPackageInfo(Patcher.GAME, 0)
+            val app = info.applicationInfo ?: return "Ошибка: данные игры не найдены."
+            val zip = ZipFile(File(app.sourceDir))
+            try {
+                val entry = zip.getEntry("classes.dex") ?: return "classes.dex не найден в APK."
+                val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                "Оригинальный classes.dex: ${bytes.size / 1024} KB\n\n" + PairipPatch.scan(bytes)
+            } finally {
+                zip.close()
+            }
+        } catch (e: Exception) {
+            "Ошибка при анализе APK: ${e.message}"
         }
-    } catch (e: Exception) {
-        "Ошибка при анализе APK: ${e.message}"
     }
 }
 
