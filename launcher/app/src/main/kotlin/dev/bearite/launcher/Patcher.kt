@@ -85,9 +85,7 @@ class Patcher(private val ctx: Context, private val log: (String) -> Unit) {
                     var bytes = zin.getInputStream(e).readBytes()
                     if (e.name.matches(Regex("classes[0-9]*\\.dex"))) {
                         val report = PairipPatch.scan(bytes)
-                        val n = Regex("""PairIP: (\d+) method""").find(report)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                        if (n > 0) {
-                            // scan() is read-only; actually mutate this copy now.
+                        if (!report.startsWith("PairIP: 0")) {
                             val mutable = bytes.copyOf()
                             val changed = PairipPatch.neuterInPlace(mutable)
                             if (changed > 0) {
@@ -147,6 +145,9 @@ class Patcher(private val ctx: Context, private val log: (String) -> Unit) {
         }
         log("Установка отправлена, подтверди системный диалог, если он появится.")
     }
+
+    // crc32() lives in DexScan.kt and is internal to the module, so it's
+    // visible here without an import.
 
     fun cleanup() {
         work.deleteRecursively()
