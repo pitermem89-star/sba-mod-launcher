@@ -12,3 +12,4 @@ work/
 out/
 DummyDll/
 dump.cs
+!launcher/app/src/main/assets/debug.keystore
