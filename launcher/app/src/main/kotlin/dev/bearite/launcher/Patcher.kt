@@ -11,6 +11,7 @@ import java.io.FileOutputStream
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.cert.X509Certificate
+import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
@@ -23,6 +24,7 @@ class Patcher(private val ctx: Context, private val log: (String) -> Unit) {
         private const val KEYSTORE_ASSET = "debug.keystore"
         private const val KEYSTORE_PASS = "bearite123"
         private const val KEY_ALIAS = "bearite"
+        private const val COPY_BUF = 256 * 1024
     }
 
     private val work = File(ctx.filesDir, "patch_work")
@@ -72,18 +74,19 @@ class Patcher(private val ctx: Context, private val log: (String) -> Unit) {
         log("Подпись готова.")
     }
 
-    // Copies one APK entry by entry, patching every classes*.dex along the way.
-    // Preserves each entry's original compression method: native libraries are
-    // often stored uncompressed on purpose (extractNativeLibs=false expects
-    // mmap access), and re-compressing them would break that.
+    // Copies one APK entry by entry. Only classes*.dex is ever loaded fully
+    // into memory (it's small and needs patching); every other entry — native
+    // libraries, Unity data packs, which can be hundreds of MB — is streamed
+    // through a small buffer so large games don't OOM the launcher's heap.
     private fun rezipWithPatch(src: File, dst: File): Int {
         var patchedCount = 0
+        val buf = ByteArray(COPY_BUF)
         ZipFile(src).use { zin ->
             ZipOutputStream(FileOutputStream(dst)).use { zout ->
                 val entries = zin.entries().toList()
                 for (e in entries) {
-                    var bytes = zin.getInputStream(e).readBytes()
                     if (e.name.matches(Regex("classes[0-9]*\\.dex"))) {
+                        var bytes = zin.getInputStream(e).readBytes()
                         val report = PairipPatch.scan(bytes)
                         if (!report.startsWith("PairIP: 0")) {
                             val mutable = bytes.copyOf()
@@ -94,19 +97,41 @@ class Patcher(private val ctx: Context, private val log: (String) -> Unit) {
                                 log(report.trimEnd())
                             }
                         }
-                    }
-                    val ne = ZipEntry(e.name)
-                    if (e.method == ZipEntry.STORED) {
-                        ne.method = ZipEntry.STORED
-                        ne.size = bytes.size.toLong()
-                        ne.compressedSize = bytes.size.toLong()
-                        ne.crc = crc32(bytes)
+                        val ne = ZipEntry(e.name)
+                        if (e.method == ZipEntry.STORED) {
+                            ne.method = ZipEntry.STORED
+                            ne.size = bytes.size.toLong()
+                            ne.compressedSize = bytes.size.toLong()
+                            val crc = CRC32(); crc.update(bytes)
+                            ne.crc = crc.value
+                        } else {
+                            ne.method = ZipEntry.DEFLATED
+                        }
+                        zout.putNextEntry(ne)
+                        zout.write(bytes)
+                        zout.closeEntry()
                     } else {
-                        ne.method = ZipEntry.DEFLATED
+                        val ne = ZipEntry(e.name)
+                        if (e.method == ZipEntry.STORED) {
+                            // Content is unchanged, so the original CRC/size are still valid —
+                            // no need to buffer the whole entry to recompute them.
+                            ne.method = ZipEntry.STORED
+                            ne.size = e.size
+                            ne.compressedSize = e.size
+                            ne.crc = e.crc
+                        } else {
+                            ne.method = ZipEntry.DEFLATED
+                        }
+                        zout.putNextEntry(ne)
+                        zin.getInputStream(e).use { input ->
+                            while (true) {
+                                val n = input.read(buf)
+                                if (n < 0) break
+                                zout.write(buf, 0, n)
+                            }
+                        }
+                        zout.closeEntry()
                     }
-                    zout.putNextEntry(ne)
-                    zout.write(bytes)
-                    zout.closeEntry()
                 }
             }
         }
@@ -145,9 +170,6 @@ class Patcher(private val ctx: Context, private val log: (String) -> Unit) {
         }
         log("Установка отправлена, подтверди системный диалог, если он появится.")
     }
-
-    // crc32() lives in DexScan.kt and is internal to the module, so it's
-    // visible here without an import.
 
     fun cleanup() {
         work.deleteRecursively()
