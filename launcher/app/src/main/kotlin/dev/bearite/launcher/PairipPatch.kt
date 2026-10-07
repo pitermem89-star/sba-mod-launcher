@@ -16,13 +16,29 @@ object PairipPatch {
         "startPaywallActivity", "scheduleAppShutdown", "scheduleRepeatedLicenseCheck"
     )
 
+    // A void method under com/pairip/ that calls one of these is almost
+    // certainly part of the shutdown/paywall path, whatever it's named.
+    // startActivity covers the method that launches the blocking screen
+    // (e.g. LicenseActivity) — neutering the launcher is safer than touching
+    // the Activity's own onCreate, which must call super.onCreate() or the
+    // app crashes with SuperNotCalledException.
     private val KILL_CALLS = setOf(
         "Ljava/lang/System;->exit",
         "Ljava/lang/Runtime;->exit",
         "Landroid/os/Process;->killProcess",
         "Landroid/app/Activity;->finish",
         "Landroid/app/Activity;->finishAffinity",
-        "Landroid/content/Context;->bindService"
+        "Landroid/content/Context;->bindService",
+        "Landroid/content/Context;->startActivity",
+        "Landroid/app/Activity;->startActivity",
+        "Landroid/app/Activity;->startActivityForResult"
+    )
+
+    // Android lifecycle callbacks must never be neutered: skipping the
+    // required super.onX() call crashes the app immediately.
+    private val LIFECYCLE_NAMES = setOf(
+        "onCreate", "onStart", "onRestart", "onResume",
+        "onPause", "onStop", "onDestroy", "<init>", "<clinit>"
     )
 
     fun scan(dex: ByteArray): String {
@@ -43,12 +59,12 @@ object PairipPatch {
         var count = 0
         for (key in hits.keys) {
             val (cls, name) = key.split("->", limit = 2)
-            val m = (reader.methods(cls) + reader.methodsByPrefix(PREFIX))
-                .firstOrNull { it.cls == cls && it.name == name && it.shorty == "V" }
+            val m = (reader.methods(cls) + reader.methodsByPrefix(PREFIX) + reader.methodsByPrefix("L"))
+                .firstOrNull { it.cls == cls && it.name == name && it.shorty.startsWith("V") }
             if (m == null || m.codeOff == 0 || m.insnsSize < 1) continue
             val start = m.codeOff + 16
             val bytes = m.insnsSize * 2
-            dex[start] = 0x0e.toByte()
+            dex[start] = 0x0e.toByte()      // return-void
             dex[start + 1] = 0
             for (i in 2 until bytes) dex[start + i] = 0
             count++
@@ -59,17 +75,23 @@ object PairipPatch {
 
     private fun findHits(reader: DexReader): LinkedHashMap<String, String> {
         val hits = LinkedHashMap<String, String>()
+
+        // Known exact names, any void signature (was: no-arg only).
         for (m in reader.methods(CLIENT_HINT)) {
-            if (m.name in KNOWN_NAMES && m.shorty == "V" && m.codeOff != 0) {
+            if (m.name in KNOWN_NAMES && m.shorty.startsWith("V") && m.codeOff != 0) {
                 hits["${m.cls}->${m.name}"] = "known name"
             }
         }
+
+        // Behaviour scan inside the pairip package itself.
         for (m in reader.methodsByPrefix(PREFIX)) {
+            if (m.name in LIFECYCLE_NAMES) continue
             val key = "${m.cls}->${m.name}"
-            if (key in hits || m.shorty != "V" || m.codeOff == 0) continue
+            if (key in hits || !m.shorty.startsWith("V") || m.codeOff == 0) continue
             val call = reader.invokedSignatures(m).firstOrNull { sig -> KILL_CALLS.any { sig.startsWith(it) } }
             if (call != null) hits[key] = "calls $call"
         }
+
         return hits
     }
 
