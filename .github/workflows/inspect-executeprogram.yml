@@ -1,0 +1,109 @@
+name: Inspect ExecuteProgram call sites
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag with libil2cpp.so"
+        default: "natives-1"
+      asset:
+        description: "Asset name"
+        default: "libil2cpp.so"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download libil2cpp.so
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ASSET: ${{ inputs.asset }}
+        run: |
+          mkdir -p in
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir in --clobber
+
+      - name: Install AArch64 tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils-aarch64-linux-gnu python3-pip
+          pip install --quiet capstone
+
+      - name: Find ExecuteProgram call sites
+        run: |
+          python3 - <<'PYEOF'
+          import struct, subprocess
+          from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+
+          path = "in/libil2cpp.so"
+
+          # --- Locate the PLT stub address for ExecuteProgram ---
+          def sh(cmd): return subprocess.check_output(cmd, shell=True, text=True)
+
+          rela = sh(f"aarch64-linux-gnu-readelf -rW {path} 2>/dev/null | grep JUMP_SLOT")
+          lines = rela.strip().split("\n")
+          idx = next(i for i, l in enumerate(lines) if "ExecuteProgram" in l)
+          print(f"ExecuteProgram is relocation #{idx} of {len(lines)}")
+
+          sec = sh(f"aarch64-linux-gnu-readelf -SW {path}")
+          def section(name):
+              for line in sec.split("\n"):
+                  if f"] {name} " in line or line.strip().startswith(f"{name} "):
+                      parts = line.split()
+                      # Name Type Address Off Size ES Flg Lk Inf Al
+                      ni = parts.index(name)
+                      return int(parts[ni+2], 16), int(parts[ni+3], 16), int(parts[ni+4], 16)
+              raise SystemExit(f"section {name} not found")
+
+          plt_addr, plt_off, plt_size = section(".plt")
+          text_addr, text_off, text_size = section(".text")
+          print(f".plt: addr={hex(plt_addr)} off={hex(plt_off)} size={hex(plt_size)}")
+          print(f".text: addr={hex(text_addr)} off={hex(text_off)} size={hex(text_size)}")
+
+          n_entries = len(lines)
+          entry_size = (plt_size - 0x48) // n_entries  # 0x48 = header guess, verified below
+          # Fallback: try common sizes if header guess is off
+          for header in (0x20, 0x30, 0x48, 0x50):
+              if (plt_size - header) % n_entries == 0:
+                  entry_size = (plt_size - header) // n_entries
+                  if entry_size in (16, 24, 32):
+                      print(f"Using header={hex(header)} entry_size={entry_size}")
+                      stub_addr = plt_addr + header + idx * entry_size
+                      break
+          else:
+              raise SystemExit("Could not determine PLT entry layout")
+
+          print(f"ExecuteProgram PLT stub address: {hex(stub_addr)}")
+
+          # --- Disassemble .text and find BL instructions targeting stub_addr ---
+          data = open(path, "rb").read()
+          text = data[text_off:text_off+text_size]
+          md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+          md.detail = False
+
+          hits = []
+          for insn in md.disasm(text, text_addr):
+              if insn.mnemonic == "bl":
+                  target = int(insn.op_str, 16) if insn.op_str.startswith("0x") else None
+                  if target == stub_addr:
+                      hits.append(insn.address)
+
+          print(f"\nFound {len(hits)} call site(s) to ExecuteProgram\n")
+
+          for addr in hits[:10]:
+              lo = max(text_addr, addr - 15*4)
+              window = text[lo-text_addr: addr-text_addr+4]
+              print(f"=== call site at {hex(addr)} ===")
+              for insn in md.disasm(window, lo):
+                  marker = "  <-- call" if insn.address == addr else ""
+                  print(f"  {hex(insn.address)}: {insn.mnemonic} {insn.op_str}{marker}")
+              print()
+          PYEOF
+
+      - name: Upload summary
+        if: always()
+        run: echo "See the step log above for call sites."
