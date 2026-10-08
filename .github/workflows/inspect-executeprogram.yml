@@ -38,6 +38,7 @@ jobs:
           python3 - <<'PYEOF'
           import subprocess
           from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+          from capstone.arm64_const import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
 
           path = "in/libil2cpp.so"
           def sh(cmd): return subprocess.check_output(cmd, shell=True, text=True)
@@ -49,57 +50,59 @@ jobs:
           print(f"ExecuteProgram GOT slot address: {hex(got_slot)}")
 
           sec = sh(f"aarch64-linux-gnu-readelf -SW {path}")
+          sections = []
+          for line in sec.split("\n"):
+              toks = line.split()
+              if len(toks) >= 8 and toks[0].startswith("[") and toks[2] == "PROGBITS":
+                  name, addr, off, size, flags = toks[1], toks[3], toks[4], toks[5], toks[7]
+                  size_i = int(size, 16)
+                  if "X" in flags and size_i > 500_000:
+                      sections.append((name, int(addr, 16), int(off, 16), size_i))
 
-          def section(name):
-              for line in sec.split("\n"):
-                  toks = line.split()
-                  # [Nr] Name Type Address Off Size ES Flg Lk Inf Al
-                  if len(toks) >= 6 and toks[0].startswith("[") and toks[1] == name:
-                      return int(toks[3], 16), int(toks[4], 16), int(toks[5], 16)
-              raise SystemExit(f"section {name} not found")
+          print("Executable sections to scan:")
+          for name, addr, off, size in sections:
+              print(f"  {name}: addr={hex(addr)} size={hex(size)} ({size/1024/1024:.1f} MB)")
+          print()
 
           data = open(path, "rb").read()
           md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+          md.detail = True
 
-          def scan(sec_name):
-              addr, off, size = section(sec_name)
-              print(f"{sec_name}: addr={hex(addr)} off={hex(off)} size={hex(size)}")
+          def scan(name, addr, off, size):
               buf = data[off:off+size]
               insns = list(md.disasm(buf, addr))
-              by_addr = {i.address: i for i in insns}
               addrs_sorted = [i.address for i in insns]
+              by_addr = {i.address: i for i in insns}
 
               hits = []
               for i, insn in enumerate(insns):
-                  if insn.mnemonic != "adrp":
+                  if insn.mnemonic != "adrp" or len(insn.operands) < 2:
                       continue
-                  try:
-                      reg, imm = insn.op_str.split(", ")
-                      page = int(imm, 16)
-                  except Exception:
-                      continue
-                  for j in range(i+1, min(i+6, len(insns))):
+                  rd = insn.operands[0].reg
+                  page = insn.operands[1].imm
+                  for j in range(i + 1, min(i + 6, len(insns))):
                       nxt = insns[j]
-                      if nxt.mnemonic == "ldr" and nxt.op_str.startswith(reg + ","):
-                          try:
-                              off_part = nxt.op_str.split("#")[-1].rstrip("]")
-                              off2 = int(off_part, 16) if off_part.startswith("0x") else int(off_part)
-                          except Exception:
-                              continue
-                          if page + off2 == got_slot:
-                              dest = nxt.op_str.split(",")[0].strip()
-                              for k in range(j+1, min(j+6, len(insns))):
-                                  br = insns[k]
-                                  if br.mnemonic in ("blr", "br") and br.op_str.strip() == dest:
-                                      hits.append(insn.address)
-                                      break
+                      if nxt.mnemonic != "ldr" or len(nxt.operands) < 2:
+                          continue
+                      mem = nxt.operands[1]
+                      if mem.type != ARM64_OP_MEM or mem.mem.base != rd or mem.mem.index != 0:
+                          continue
+                      eff = page + mem.mem.disp
+                      if eff != got_slot:
                           break
+                      dest_reg = nxt.operands[0].reg
+                      for k in range(j + 1, min(j + 6, len(insns))):
+                          br = insns[k]
+                          if br.mnemonic in ("blr", "br") and br.operands and br.operands[0].reg == dest_reg:
+                              hits.append(insn.address)
+                              break
+                      break
 
-              print(f"  -> {len(hits)} call site(s) found in {sec_name}\n")
+              print(f"{name}: {len(hits)} call site(s)")
               for addr2 in hits[:10]:
-                  lo = max(addr, addr2 - 10*4)
-                  hi = addr2 + 15*4
-                  print(f"=== around {hex(addr2)} (in {sec_name}) ===")
+                  lo = max(addr, addr2 - 10 * 4)
+                  hi = addr2 + 15 * 4
+                  print(f"=== around {hex(addr2)} (in {name}) ===")
                   for a in addrs_sorted:
                       if lo <= a <= hi:
                           ins = by_addr[a]
@@ -108,10 +111,23 @@ jobs:
               return hits
 
           total = []
-          for name in (".text", "il2cpp"):
-              total += scan(name)
+          for name, addr, off, size in sections:
+              total += scan(name, addr, off, size)
 
-          print(f"\nTOTAL call sites found: {len(total)}")
+          print(f"TOTAL call sites found: {len(total)}")
+
+          if total == 0:
+              print("\nFallback: dumping raw bytes of the GOT slot area for manual inspection.")
+              sec2 = sh(f"aarch64-linux-gnu-readelf -SW {path}")
+              for line in sec2.split("\n"):
+                  toks = line.split()
+                  if len(toks) >= 6 and toks[0].startswith("[") and toks[2] == "PROGBITS":
+                      try:
+                          a, o, s = int(toks[3], 16), int(toks[4], 16), int(toks[5], 16)
+                      except Exception:
+                          continue
+                      if a <= got_slot < a + s:
+                          print(f"GOT slot lives in section {toks[1]} ({hex(a)}..{hex(a+s)})")
           PYEOF
 
       - name: Upload summary
