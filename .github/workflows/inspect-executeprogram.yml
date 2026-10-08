@@ -36,71 +36,91 @@ jobs:
       - name: Find ExecuteProgram call sites
         run: |
           python3 - <<'PYEOF'
-          import struct, subprocess
+          import subprocess
           from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
 
           path = "in/libil2cpp.so"
-
-          # --- Locate the PLT stub address for ExecuteProgram ---
           def sh(cmd): return subprocess.check_output(cmd, shell=True, text=True)
 
+          # --- GOT slot for ExecuteProgram (the cell the dynamic linker fills in) ---
           rela = sh(f"aarch64-linux-gnu-readelf -rW {path} 2>/dev/null | grep JUMP_SLOT")
           lines = rela.strip().split("\n")
           idx = next(i for i, l in enumerate(lines) if "ExecuteProgram" in l)
-          print(f"ExecuteProgram is relocation #{idx} of {len(lines)}")
+          got_slot = int(lines[idx].split()[0], 16)
+          print(f"ExecuteProgram GOT slot address: {hex(got_slot)}")
 
+          # --- Sanity-check section sizes ---
           sec = sh(f"aarch64-linux-gnu-readelf -SW {path}")
+          print("---- all PROGBITS sections over 1MB ----")
+          for line in sec.split("\n"):
+              parts = line.split()
+              if len(parts) >= 6 and parts[0].startswith("[") and "PROGBITS" in line:
+                  try:
+                      size = int(parts[5], 16)
+                  except Exception:
+                      continue
+                  if size > 0x100000:
+                      print(line)
+
           def section(name):
               for line in sec.split("\n"):
-                  if f"] {name} " in line or line.strip().startswith(f"{name} "):
-                      parts = line.split()
-                      # Name Type Address Off Size ES Flg Lk Inf Al
-                      ni = parts.index(name)
-                      return int(parts[ni+2], 16), int(parts[ni+3], 16), int(parts[ni+4], 16)
+                  toks = line.split()
+                  if len(toks) >= 2 and toks[1] == name:
+                      return int(toks[2], 16), int(toks[3], 16), int(toks[4], 16)
               raise SystemExit(f"section {name} not found")
 
-          plt_addr, plt_off, plt_size = section(".plt")
           text_addr, text_off, text_size = section(".text")
-          print(f".plt: addr={hex(plt_addr)} off={hex(plt_off)} size={hex(plt_size)}")
           print(f".text: addr={hex(text_addr)} off={hex(text_off)} size={hex(text_size)}")
 
-          n_entries = len(lines)
-          entry_size = (plt_size - 0x48) // n_entries  # 0x48 = header guess, verified below
-          # Fallback: try common sizes if header guess is off
-          for header in (0x20, 0x30, 0x48, 0x50):
-              if (plt_size - header) % n_entries == 0:
-                  entry_size = (plt_size - header) // n_entries
-                  if entry_size in (16, 24, 32):
-                      print(f"Using header={hex(header)} entry_size={entry_size}")
-                      stub_addr = plt_addr + header + idx * entry_size
-                      break
-          else:
-              raise SystemExit("Could not determine PLT entry layout")
-
-          print(f"ExecuteProgram PLT stub address: {hex(stub_addr)}")
-
-          # --- Disassemble .text and find BL instructions targeting stub_addr ---
           data = open(path, "rb").read()
           text = data[text_off:text_off+text_size]
           md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
-          md.detail = False
 
+          # Pass 1: decode every instruction once, keep a simple address->insn map
+          insns = list(md.disasm(text, text_addr))
+          by_addr = {i.address: i for i in insns}
+          addrs_sorted = [i.address for i in insns]
+
+          # Pass 2: find ADRP+LDR pairs whose effective address equals got_slot,
+          # then look a few instructions ahead for a blr using that register.
           hits = []
-          for insn in md.disasm(text, text_addr):
-              if insn.mnemonic == "bl":
-                  target = int(insn.op_str, 16) if insn.op_str.startswith("0x") else None
-                  if target == stub_addr:
-                      hits.append(insn.address)
+          for i, insn in enumerate(insns):
+              if insn.mnemonic != "adrp":
+                  continue
+              try:
+                  reg, imm = insn.op_str.split(", ")
+                  page = int(imm, 16)
+              except Exception:
+                  continue
+              # look ahead up to 4 instructions for a matching ldr and later blr
+              for j in range(i+1, min(i+6, len(insns))):
+                  nxt = insns[j]
+                  if nxt.mnemonic == "ldr" and nxt.op_str.startswith(reg + ","):
+                      # effective address = page + ldr immediate offset
+                      try:
+                          off_part = nxt.op_str.split("#")[-1].rstrip("]")
+                          off = int(off_part, 16) if off_part.startswith("0x") else int(off_part)
+                      except Exception:
+                          continue
+                      if page + off == got_slot:
+                          # destination register of the ldr
+                          dest = nxt.op_str.split(",")[0].strip()
+                          for k in range(j+1, min(j+6, len(insns))):
+                              br = insns[k]
+                              if br.mnemonic in ("blr", "br") and br.op_str.strip() == dest:
+                                  hits.append(insn.address)
+                                  break
+                      break
 
-          print(f"\nFound {len(hits)} call site(s) to ExecuteProgram\n")
-
+          print(f"\nFound {len(hits)} indirect call site(s) to ExecuteProgram via GOT\n")
           for addr in hits[:10]:
-              lo = max(text_addr, addr - 15*4)
-              window = text[lo-text_addr: addr-text_addr+4]
-              print(f"=== call site at {hex(addr)} ===")
-              for insn in md.disasm(window, lo):
-                  marker = "  <-- call" if insn.address == addr else ""
-                  print(f"  {hex(insn.address)}: {insn.mnemonic} {insn.op_str}{marker}")
+              lo = max(text_addr, addr - 10*4)
+              hi = addr + 15*4
+              print(f"=== around {hex(addr)} ===")
+              for a in addrs_sorted:
+                  if lo <= a <= hi:
+                      ins = by_addr[a]
+                      print(f"  {hex(a)}: {ins.mnemonic} {ins.op_str}")
               print()
           PYEOF
 
