@@ -36,9 +36,9 @@ jobs:
       - name: Find ExecuteProgram call sites
         run: |
           python3 - <<'PYEOF'
-          import subprocess
+          import struct, subprocess
           from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
-          from capstone.arm64_const import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
+          from capstone.arm64_const import ARM64_OP_MEM
 
           path = "in/libil2cpp.so"
           def sh(cmd): return subprocess.check_output(cmd, shell=True, text=True)
@@ -48,6 +48,8 @@ jobs:
           idx = next(i for i, l in enumerate(lines) if "ExecuteProgram" in l)
           got_slot = int(lines[idx].split()[0], 16)
           print(f"ExecuteProgram GOT slot address: {hex(got_slot)}")
+          got_page = got_slot & ~0xFFF
+          print(f"GOT slot page: {hex(got_page)} (page offset {hex(got_slot - got_page)})")
 
           sec = sh(f"aarch64-linux-gnu-readelf -SW {path}")
           sections = []
@@ -65,69 +67,73 @@ jobs:
           print()
 
           data = open(path, "rb").read()
+
+          # --- Fast raw-bytes pass: decode ADRP encoding directly, no disassembler. ---
+          # ADRP: bit31=op(1) bits30-29=immlo bits28-24=10000 bits23-5=immhi(19) bits4-0=Rd
+          def sign21(v):
+              return v - (1 << 21) if v & (1 << 20) else v
+
+          candidates = []  # (abs_address, Rd)
+          for name, addr, off, size in sections:
+              n_words = size // 4
+              words = struct.unpack(f"<{n_words}I", data[off:off + n_words*4])
+              for i, w in enumerate(words):
+                  if (w >> 31) & 1 != 1:
+                      continue
+                  if (w >> 24) & 0x1F != 0b10000:
+                      continue
+                  immlo = (w >> 29) & 0b11
+                  immhi = (w >> 5) & 0x7FFFF
+                  imm21 = sign21((immhi << 2) | immlo)
+                  this_addr = addr + i * 4
+                  page = (this_addr & ~0xFFF) + (imm21 << 12)
+                  if page == got_page:
+                      rd = w & 0x1F
+                      candidates.append((this_addr, rd, name, addr, off, size))
+
+          print(f"ADRP candidates pointing at the GOT slot's page: {len(candidates)}\n")
+
+          # --- For each candidate, disassemble a small window with Capstone to
+          # confirm the LDR uses the right offset and is followed by blr/br. ---
           md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
           md.detail = True
-
-          def scan(name, addr, off, size):
-              buf = data[off:off+size]
-              insns = list(md.disasm(buf, addr))
-              addrs_sorted = [i.address for i in insns]
-              by_addr = {i.address: i for i in insns}
-
-              hits = []
-              for i, insn in enumerate(insns):
-                  if insn.mnemonic != "adrp" or len(insn.operands) < 2:
+          hits = []
+          for this_addr, rd, name, sec_addr, sec_off, sec_size in candidates:
+              local = this_addr - sec_addr
+              window = data[sec_off + local: sec_off + local + 6*4]
+              insns = list(md.disasm(window, this_addr))
+              if not insns:
+                  continue
+              for j in range(1, len(insns)):
+                  nxt = insns[j]
+                  if nxt.mnemonic != "ldr" or len(nxt.operands) < 2:
                       continue
-                  rd = insn.operands[0].reg
-                  page = insn.operands[1].imm
-                  for j in range(i + 1, min(i + 6, len(insns))):
-                      nxt = insns[j]
-                      if nxt.mnemonic != "ldr" or len(nxt.operands) < 2:
-                          continue
-                      mem = nxt.operands[1]
-                      if mem.type != ARM64_OP_MEM or mem.mem.base != rd or mem.mem.index != 0:
-                          continue
-                      eff = page + mem.mem.disp
-                      if eff != got_slot:
+                  mem = nxt.operands[1]
+                  if mem.type != ARM64_OP_MEM or mem.mem.base != rd or mem.mem.index != 0:
+                      continue
+                  if mem.mem.disp != (got_slot - got_page):
+                      continue
+                  dest_reg = nxt.operands[0].reg
+                  for k in range(j+1, min(j+6, len(insns))):
+                      br = insns[k]
+                      if br.mnemonic in ("blr", "br") and br.operands and br.operands[0].reg == dest_reg:
+                          hits.append((this_addr, name))
                           break
-                      dest_reg = nxt.operands[0].reg
-                      for k in range(j + 1, min(j + 6, len(insns))):
-                          br = insns[k]
-                          if br.mnemonic in ("blr", "br") and br.operands and br.operands[0].reg == dest_reg:
-                              hits.append(insn.address)
-                              break
-                      break
+                  break
 
-              print(f"{name}: {len(hits)} call site(s)")
-              for addr2 in hits[:10]:
-                  lo = max(addr, addr2 - 10 * 4)
-                  hi = addr2 + 15 * 4
-                  print(f"=== around {hex(addr2)} (in {name}) ===")
-                  for a in addrs_sorted:
-                      if lo <= a <= hi:
-                          ins = by_addr[a]
-                          print(f"  {hex(a)}: {ins.mnemonic} {ins.op_str}")
-                  print()
-              return hits
+          print(f"Confirmed call sites: {len(hits)}\n")
+          for this_addr, name in hits[:10]:
+              sec_addr, sec_off, sec_size = next((a,o,s) for n,a,o,s in [(n,a,o,s) for n,a,o,s in [(x[2],x[3],x[4],x[5]) for x in candidates if x[0]==this_addr]][:1])
+              local = this_addr - sec_addr
+              lo = max(0, local - 10*4)
+              window = data[sec_off+lo: sec_off+local+15*4]
+              print(f"=== around {hex(this_addr)} (in {name}) ===")
+              for insn in md.disasm(window, sec_addr+lo):
+                  marker = "  <-- adrp" if insn.address == this_addr else ""
+                  print(f"  {hex(insn.address)}: {insn.mnemonic} {insn.op_str}{marker}")
+              print()
 
-          total = []
-          for name, addr, off, size in sections:
-              total += scan(name, addr, off, size)
-
-          print(f"TOTAL call sites found: {len(total)}")
-
-          if total == 0:
-              print("\nFallback: dumping raw bytes of the GOT slot area for manual inspection.")
-              sec2 = sh(f"aarch64-linux-gnu-readelf -SW {path}")
-              for line in sec2.split("\n"):
-                  toks = line.split()
-                  if len(toks) >= 6 and toks[0].startswith("[") and toks[2] == "PROGBITS":
-                      try:
-                          a, o, s = int(toks[3], 16), int(toks[4], 16), int(toks[5], 16)
-                      except Exception:
-                          continue
-                      if a <= got_slot < a + s:
-                          print(f"GOT slot lives in section {toks[1]} ({hex(a)}..{hex(a+s)})")
+          print(f"TOTAL confirmed call sites: {len(hits)}")
           PYEOF
 
       - name: Upload summary
