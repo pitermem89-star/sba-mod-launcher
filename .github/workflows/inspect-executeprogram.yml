@@ -42,86 +42,76 @@ jobs:
           path = "in/libil2cpp.so"
           def sh(cmd): return subprocess.check_output(cmd, shell=True, text=True)
 
-          # --- GOT slot for ExecuteProgram (the cell the dynamic linker fills in) ---
           rela = sh(f"aarch64-linux-gnu-readelf -rW {path} 2>/dev/null | grep JUMP_SLOT")
           lines = rela.strip().split("\n")
           idx = next(i for i, l in enumerate(lines) if "ExecuteProgram" in l)
           got_slot = int(lines[idx].split()[0], 16)
           print(f"ExecuteProgram GOT slot address: {hex(got_slot)}")
 
-          # --- Sanity-check section sizes ---
           sec = sh(f"aarch64-linux-gnu-readelf -SW {path}")
-          print("---- all PROGBITS sections over 1MB ----")
-          for line in sec.split("\n"):
-              parts = line.split()
-              if len(parts) >= 6 and parts[0].startswith("[") and "PROGBITS" in line:
-                  try:
-                      size = int(parts[5], 16)
-                  except Exception:
-                      continue
-                  if size > 0x100000:
-                      print(line)
 
           def section(name):
               for line in sec.split("\n"):
                   toks = line.split()
-                  if len(toks) >= 2 and toks[1] == name:
-                      return int(toks[2], 16), int(toks[3], 16), int(toks[4], 16)
+                  # [Nr] Name Type Address Off Size ES Flg Lk Inf Al
+                  if len(toks) >= 6 and toks[0].startswith("[") and toks[1] == name:
+                      return int(toks[3], 16), int(toks[4], 16), int(toks[5], 16)
               raise SystemExit(f"section {name} not found")
 
-          text_addr, text_off, text_size = section(".text")
-          print(f".text: addr={hex(text_addr)} off={hex(text_off)} size={hex(text_size)}")
-
           data = open(path, "rb").read()
-          text = data[text_off:text_off+text_size]
           md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
 
-          # Pass 1: decode every instruction once, keep a simple address->insn map
-          insns = list(md.disasm(text, text_addr))
-          by_addr = {i.address: i for i in insns}
-          addrs_sorted = [i.address for i in insns]
+          def scan(sec_name):
+              addr, off, size = section(sec_name)
+              print(f"{sec_name}: addr={hex(addr)} off={hex(off)} size={hex(size)}")
+              buf = data[off:off+size]
+              insns = list(md.disasm(buf, addr))
+              by_addr = {i.address: i for i in insns}
+              addrs_sorted = [i.address for i in insns]
 
-          # Pass 2: find ADRP+LDR pairs whose effective address equals got_slot,
-          # then look a few instructions ahead for a blr using that register.
-          hits = []
-          for i, insn in enumerate(insns):
-              if insn.mnemonic != "adrp":
-                  continue
-              try:
-                  reg, imm = insn.op_str.split(", ")
-                  page = int(imm, 16)
-              except Exception:
-                  continue
-              # look ahead up to 4 instructions for a matching ldr and later blr
-              for j in range(i+1, min(i+6, len(insns))):
-                  nxt = insns[j]
-                  if nxt.mnemonic == "ldr" and nxt.op_str.startswith(reg + ","):
-                      # effective address = page + ldr immediate offset
-                      try:
-                          off_part = nxt.op_str.split("#")[-1].rstrip("]")
-                          off = int(off_part, 16) if off_part.startswith("0x") else int(off_part)
-                      except Exception:
-                          continue
-                      if page + off == got_slot:
-                          # destination register of the ldr
-                          dest = nxt.op_str.split(",")[0].strip()
-                          for k in range(j+1, min(j+6, len(insns))):
-                              br = insns[k]
-                              if br.mnemonic in ("blr", "br") and br.op_str.strip() == dest:
-                                  hits.append(insn.address)
-                                  break
-                      break
+              hits = []
+              for i, insn in enumerate(insns):
+                  if insn.mnemonic != "adrp":
+                      continue
+                  try:
+                      reg, imm = insn.op_str.split(", ")
+                      page = int(imm, 16)
+                  except Exception:
+                      continue
+                  for j in range(i+1, min(i+6, len(insns))):
+                      nxt = insns[j]
+                      if nxt.mnemonic == "ldr" and nxt.op_str.startswith(reg + ","):
+                          try:
+                              off_part = nxt.op_str.split("#")[-1].rstrip("]")
+                              off2 = int(off_part, 16) if off_part.startswith("0x") else int(off_part)
+                          except Exception:
+                              continue
+                          if page + off2 == got_slot:
+                              dest = nxt.op_str.split(",")[0].strip()
+                              for k in range(j+1, min(j+6, len(insns))):
+                                  br = insns[k]
+                                  if br.mnemonic in ("blr", "br") and br.op_str.strip() == dest:
+                                      hits.append(insn.address)
+                                      break
+                          break
 
-          print(f"\nFound {len(hits)} indirect call site(s) to ExecuteProgram via GOT\n")
-          for addr in hits[:10]:
-              lo = max(text_addr, addr - 10*4)
-              hi = addr + 15*4
-              print(f"=== around {hex(addr)} ===")
-              for a in addrs_sorted:
-                  if lo <= a <= hi:
-                      ins = by_addr[a]
-                      print(f"  {hex(a)}: {ins.mnemonic} {ins.op_str}")
-              print()
+              print(f"  -> {len(hits)} call site(s) found in {sec_name}\n")
+              for addr2 in hits[:10]:
+                  lo = max(addr, addr2 - 10*4)
+                  hi = addr2 + 15*4
+                  print(f"=== around {hex(addr2)} (in {sec_name}) ===")
+                  for a in addrs_sorted:
+                      if lo <= a <= hi:
+                          ins = by_addr[a]
+                          print(f"  {hex(a)}: {ins.mnemonic} {ins.op_str}")
+                  print()
+              return hits
+
+          total = []
+          for name in (".text", "il2cpp"):
+              total += scan(name)
+
+          print(f"\nTOTAL call sites found: {len(total)}")
           PYEOF
 
       - name: Upload summary
