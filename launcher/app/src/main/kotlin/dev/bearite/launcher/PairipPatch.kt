@@ -16,12 +16,18 @@ object PairipPatch {
         "startPaywallActivity", "scheduleAppShutdown", "scheduleRepeatedLicenseCheck"
     )
 
-    // A void method under com/pairip/ that calls one of these is almost
-    // certainly part of the shutdown/paywall path, whatever it's named.
-    // startActivity covers the method that launches the blocking screen
-    // (e.g. LicenseActivity) — neutering the launcher is safer than touching
-    // the Activity's own onCreate, which must call super.onCreate() or the
-    // app crashes with SuperNotCalledException.
+    // Explicit (class, method) pairs found by reading the real decompiled
+    // source, for checks that don't fit the "calls a kill signature" pattern.
+    // SignatureCheck.verifyIntegrity() just throws a RuntimeException on a
+    // hash mismatch — since we re-sign the APK, this always fires, and it
+    // runs in Application.attachBaseContext() BEFORE LicenseClient.checkLicense()
+    // ever gets a chance to run. This was the real root cause of the paywall
+    // screen surviving every previous patch: we were neutering the license
+    // flow while this fired first and independently.
+    private val EXPLICIT_TARGETS = setOf(
+        "Lcom/pairip/SignatureCheck;" to "verifyIntegrity"
+    )
+
     private val KILL_CALLS = setOf(
         "Ljava/lang/System;->exit",
         "Ljava/lang/Runtime;->exit",
@@ -34,8 +40,6 @@ object PairipPatch {
         "Landroid/app/Activity;->startActivityForResult"
     )
 
-    // Android lifecycle callbacks must never be neutered: skipping the
-    // required super.onX() call crashes the app immediately.
     private val LIFECYCLE_NAMES = setOf(
         "onCreate", "onStart", "onRestart", "onResume",
         "onPause", "onStop", "onDestroy", "<init>", "<clinit>"
@@ -76,14 +80,20 @@ object PairipPatch {
     private fun findHits(reader: DexReader): LinkedHashMap<String, String> {
         val hits = LinkedHashMap<String, String>()
 
-        // Known exact names, any void signature (was: no-arg only).
         for (m in reader.methods(CLIENT_HINT)) {
             if (m.name in KNOWN_NAMES && m.shorty.startsWith("V") && m.codeOff != 0) {
                 hits["${m.cls}->${m.name}"] = "known name"
             }
         }
 
-        // Behaviour scan inside the pairip package itself.
+        for ((cls, name) in EXPLICIT_TARGETS) {
+            for (m in reader.methods(cls)) {
+                if (m.name == name && m.shorty.startsWith("V") && m.codeOff != 0) {
+                    hits["${m.cls}->${m.name}"] = "explicit target"
+                }
+            }
+        }
+
         for (m in reader.methodsByPrefix(PREFIX)) {
             if (m.name in LIFECYCLE_NAMES) continue
             val key = "${m.cls}->${m.name}"
