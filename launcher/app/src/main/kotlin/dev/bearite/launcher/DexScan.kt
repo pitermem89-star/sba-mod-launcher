@@ -4,7 +4,6 @@ import android.content.Context
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.zip.CRC32
 import java.util.zip.ZipFile
 
 class MethodInfo(
@@ -49,7 +48,6 @@ class DexReader(private val data: ByteArray) {
         return result
     }
 
-    // "Lclass;->name" for a method_ids index — used to see what a call targets.
     fun methodSignature(methodIdx: Int): String {
         val m = methodIdsOff + methodIdx * 8
         val classIdx = buf.getShort(m).toInt() and 0xffff
@@ -88,7 +86,6 @@ class DexReader(private val data: ByteArray) {
         }
     }
 
-    // Methods of one exact class name.
     fun methods(className: String): List<MethodInfo> {
         val result = ArrayList<MethodInfo>()
         for (i in 0 until classDefsSize) {
@@ -98,8 +95,6 @@ class DexReader(private val data: ByteArray) {
         return result
     }
 
-    // Every method of every class whose type name starts with `prefix`,
-    // e.g. "Lcom/pairip/" — survives PairIP renaming the class itself.
     fun methodsByPrefix(prefix: String): List<MethodInfo> {
         val result = ArrayList<MethodInfo>()
         for (i in 0 until classDefsSize) {
@@ -110,11 +105,6 @@ class DexReader(private val data: ByteArray) {
         return result
     }
 
-    // Method signatures this method's bytecode calls. Lightweight scan — looks
-    // only for invoke-* opcodes, doesn't decode every other opcode's operand
-    // length precisely, so on rare byte patterns it can report one extra
-    // signature. Used only as one signal among several, so a stray false
-    // positive here is harmless.
     fun invokedSignatures(m: MethodInfo): Set<String> {
         if (m.codeOff == 0) return emptySet()
         val insnsOff = m.codeOff + 16
@@ -142,15 +132,26 @@ class DexReader(private val data: ByteArray) {
 }
 
 object PairipScan {
+    // Scans every classes*.dex in the APK, not just "classes.dex" — PairIP's
+    // classes can live in a secondary dex file depending on multidex layout.
     fun run(ctx: Context): String {
         return try {
             val info = ctx.packageManager.getPackageInfo(Patcher.GAME, 0)
             val app = info.applicationInfo ?: return "Ошибка: данные игры не найдены."
             val zip = ZipFile(File(app.sourceDir))
             try {
-                val entry = zip.getEntry("classes.dex") ?: return "classes.dex не найден в APK."
-                val bytes = zip.getInputStream(entry).use { it.readBytes() }
-                "Оригинальный classes.dex: ${bytes.size / 1024} KB\n\n" + PairipPatch.scan(bytes)
+                val dexEntries = zip.entries().toList()
+                    .filter { it.name.matches(Regex("classes[0-9]*\\.dex")) }
+                    .sortedBy { it.name }
+                if (dexEntries.isEmpty()) return "В базовом APK не найдено ни одного classes*.dex."
+                val sb = StringBuilder()
+                for (entry in dexEntries) {
+                    val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                    sb.append("== ${entry.name} (${bytes.size / 1024} KB) ==\n")
+                    sb.append(PairipPatch.scan(bytes))
+                    sb.append('\n')
+                }
+                sb.toString()
             } finally {
                 zip.close()
             }
@@ -158,10 +159,4 @@ object PairipScan {
             "Ошибка при анализе APK: ${e.message}"
         }
     }
-}
-
-internal fun crc32(bytes: ByteArray): Long {
-    val c = CRC32()
-    c.update(bytes)
-    return c.value
 }
