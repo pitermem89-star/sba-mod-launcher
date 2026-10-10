@@ -1,0 +1,91 @@
+name: Decompile game dex
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag with the game APK split files"
+        default: "v1"
+      asset:
+        description: "Asset name pattern (matches all split APKs)"
+        default: "*.apk"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash {0}
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download game package(s)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ASSET: ${{ inputs.asset }}
+        run: |
+          mkdir -p in tools out
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir in --clobber
+          ls -la in
+
+      - name: Locate the split that actually contains classes.dex
+        run: |
+          BASE=""
+          for f in in/*.apk; do
+            if unzip -l "$f" 2>/dev/null | grep -qE 'classes[0-9]*\.dex$'; then
+              BASE="$f"
+              echo "Found classes.dex in: $f"
+              break
+            fi
+          done
+          if [ -z "$BASE" ]; then
+            echo "::error::None of the downloaded APKs contain classes.dex. Files present:"
+            ls -la in
+            exit 1
+          fi
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+
+      - name: Download jadx
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo skylot/jadx --pattern 'jadx-[0-9]*.zip' --dir tools --clobber
+          unzip -q -o tools/jadx-*.zip -d tools/jadx
+          chmod +x tools/jadx/bin/jadx
+
+      - name: Decompile classes.dex (all dex files from the base split)
+        run: |
+          mkdir -p out/dex
+          unzip -q -o "$BASE" 'classes*.dex' -d out/dex
+          ls -la out/dex
+          for f in out/dex/classes*.dex; do
+            tools/jadx/bin/jadx --no-res -d out/src "$f" >> out/jadx.log 2>&1 || true
+          done
+
+      - name: Summary
+        run: |
+          {
+            echo "## com/pairip source (decompiled)"
+            if [ -d out/src/sources/com/pairip ]; then
+              find out/src/sources/com/pairip -name '*.java' | sed 's|out/src/sources/||'
+            else
+              echo "com/pairip package not found after decompiling. jadx.log tail:"
+              echo '```'
+              tail -n 30 out/jadx.log
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: game-pairip-src
+          path: |
+            out/src/sources/com/pairip
+            out/jadx.log
+          if-no-files-found: warn
+          retention-days: 7
