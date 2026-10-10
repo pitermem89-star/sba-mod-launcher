@@ -16,28 +16,11 @@ object PairipPatch {
         "startPaywallActivity", "scheduleAppShutdown", "scheduleRepeatedLicenseCheck"
     )
 
-    // Explicit (class, method) pairs found by reading the real decompiled
-    // source — for checks that don't fit the "calls a kill signature"
-    // pattern that our behaviour scan looks for.
-    //
-    // SignatureCheck.verifyIntegrity() just throws a RuntimeException on a
-    // hash mismatch; since we re-sign the APK this always fires, and it runs
-    // in Application.attachBaseContext() before LicenseClient.checkLicense()
-    // ever gets a chance to run.
-    //
-    // StartupLauncher.launch() runs even earlier, from Application's static
-    // initializer, and hands off to VMRunner.invoke(), which loads an
-    // encrypted bytecode blob from assets/ and executes it in PairIP's
-    // native VM (libpairipcore.so). This is the real call that earlier
-    // native-code (ARM64) analysis was hunting for — it's an ordinary `native`
-    // Java method call (VMRunner.executeVM), not a static link from
-    // libil2cpp.so, which is why searching libil2cpp.so's disassembly never
-    // found it. Neutering launch() stops the native VM from ever running,
-    // without touching VMRunner.invoke() itself (kept intact in case
-    // anything else in the game calls it for an unrelated reason).
+    // Testing in isolation: StartupLauncher.launch() removed from this set for
+    // now — the game crashed on launch after it was neutered, so we're
+    // checking whether verifyIntegrity alone is safe before reintroducing it.
     private val EXPLICIT_TARGETS = setOf(
-        "Lcom/pairip/SignatureCheck;" to "verifyIntegrity",
-        "Lcom/pairip/StartupLauncher;" to "launch"
+        "Lcom/pairip/SignatureCheck;" to "verifyIntegrity"
     )
 
     private val KILL_CALLS = setOf(
