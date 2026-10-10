@@ -17,15 +17,27 @@ object PairipPatch {
     )
 
     // Explicit (class, method) pairs found by reading the real decompiled
-    // source, for checks that don't fit the "calls a kill signature" pattern.
+    // source — for checks that don't fit the "calls a kill signature"
+    // pattern that our behaviour scan looks for.
+    //
     // SignatureCheck.verifyIntegrity() just throws a RuntimeException on a
-    // hash mismatch — since we re-sign the APK, this always fires, and it
-    // runs in Application.attachBaseContext() BEFORE LicenseClient.checkLicense()
-    // ever gets a chance to run. This was the real root cause of the paywall
-    // screen surviving every previous patch: we were neutering the license
-    // flow while this fired first and independently.
+    // hash mismatch; since we re-sign the APK this always fires, and it runs
+    // in Application.attachBaseContext() before LicenseClient.checkLicense()
+    // ever gets a chance to run.
+    //
+    // StartupLauncher.launch() runs even earlier, from Application's static
+    // initializer, and hands off to VMRunner.invoke(), which loads an
+    // encrypted bytecode blob from assets/ and executes it in PairIP's
+    // native VM (libpairipcore.so). This is the real call that earlier
+    // native-code (ARM64) analysis was hunting for — it's an ordinary `native`
+    // Java method call (VMRunner.executeVM), not a static link from
+    // libil2cpp.so, which is why searching libil2cpp.so's disassembly never
+    // found it. Neutering launch() stops the native VM from ever running,
+    // without touching VMRunner.invoke() itself (kept intact in case
+    // anything else in the game calls it for an unrelated reason).
     private val EXPLICIT_TARGETS = setOf(
-        "Lcom/pairip/SignatureCheck;" to "verifyIntegrity"
+        "Lcom/pairip/SignatureCheck;" to "verifyIntegrity",
+        "Lcom/pairip/StartupLauncher;" to "launch"
     )
 
     private val KILL_CALLS = setOf(
@@ -51,8 +63,7 @@ object PairipPatch {
         val sb = StringBuilder("PairIP: ${hits.size} method(s) detected\n")
         for ((key, reason) in hits) sb.append("  - $key ($reason)\n")
         if (hits.isEmpty()) {
-            sb.append("  Ничего не найдено. Игра может быть не защищена, уже пропатчена, ")
-                .append("или защита изменилась так, что этот сканер её не узнаёт.\n")
+            sb.append("  Ничего не найдено в этом dex-файле.\n")
         }
         return sb.toString()
     }
